@@ -27,7 +27,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 
 from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import (
-    sparse_mla_fwd,
+    sparse_mla_fwd as _sparse_mla_fwd_triton,
     sparse_mla_bwd,
     sparse_mla_train,
 )
@@ -252,6 +252,10 @@ def benchmark_fwd(
     flops_fwd = total_tokens * num_heads * topk * (2 * d_qk + 2 * kv_lora_rank)
     tflops = flops_fwd / (ms * 1e-3) / 1e12
 
+    if os.environ.get("USE_GLUON_DSA", "0") != "1":
+        from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import _sparse_mla_fwd_train_kernel
+        print(f"Best cofig: {_sparse_mla_fwd_train_kernel.best_config}")
+
     label = f"B{batch}_S{seq_len}_H{num_heads}_topk{topk}"
     print(f"  {label:<30s} {ms:8.2f} ms  {tflops:8.1f} TFLOPS")
     return ms
@@ -300,9 +304,10 @@ def main():
         print("  BENCHMARK: Forward")
         print("=" * 64)
         fwd_configs = [
-            (1, 4096, 128, 512, 64, 1024),
-            (1, 4096, 128, 512, 64, 2048),
-            (1, 8192, 128, 512, 64, 1024),
+            # (1, 4096, 128, 512, 64, 1024),
+            # (1, 4096, 128, 512, 64, 2048),
+            # (1, 8192, 128, 512, 64, 1024),
+            (1, 8192, 128, 512, 64, 2048),
         ]
         for cfg in fwd_configs:
             try:
@@ -310,19 +315,19 @@ def main():
             except Exception as e:
                 print(f"  SKIPPED {cfg}: {e}")
 
-        print("\n" + "=" * 64)
-        print("  BENCHMARK: Backward (4 methods)")
-        print("=" * 64)
-        bwd_configs = [
-            (1, 4096, 128, 512, 64, 1024),
-            (1, 4096, 128, 512, 64, 2048),
-            (1, 8192, 128, 512, 64, 1024),
-        ]
-        for cfg in bwd_configs:
-            try:
-                benchmark_methods(*cfg, device=device)
-            except Exception as e:
-                print(f"  SKIPPED {cfg}: {e}")
+        # print("\n" + "=" * 64)
+        # print("  BENCHMARK: Backward (4 methods)")
+        # print("=" * 64)
+        # bwd_configs = [
+        #     (1, 4096, 128, 512, 64, 1024),
+        #     (1, 4096, 128, 512, 64, 2048),
+        #     (1, 8192, 128, 512, 64, 1024),
+        # ]
+        # for cfg in bwd_configs:
+        #     try:
+        #         benchmark_methods(*cfg, device=device)
+        #     except Exception as e:
+        #         print(f"  SKIPPED {cfg}: {e}")
 
 
 if __name__ == "__main__":
