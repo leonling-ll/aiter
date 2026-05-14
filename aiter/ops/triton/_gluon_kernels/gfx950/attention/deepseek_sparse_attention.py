@@ -43,29 +43,6 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 
-# =====================================================================
-# Layouts (constexpr factories so they're sharable across kernels)
-# =====================================================================
-
-# MFMA layouts
-# S = [BLOCK_H=64, TILE_K=16] bf16 inputs => fp32 accumulator
-# acc = [BLOCK_H=64, D_V=512] fp32 accumulator
-def _mfma_s():
-    # Triton's #mma uses instrShape=[16,16,32] with kWidth=8 — that is two
-    # k=16 MFMA instructions fused. We use the smaller native 16x16x16 here.
-    return gl.amd.cdna4.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 16],
-        transposed=True, warps_per_cta=[4, 1],
-    )
-
-
-def _mfma_acc():
-    return gl.amd.cdna4.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 16],
-        transposed=True, warps_per_cta=[4, 1],
-    )
-
-
 @gluon.jit
 def _sparse_mla_fwd_gl_kernel(
     Q_ptr,          # [total_tokens, num_heads, D_QK] bf16
@@ -98,19 +75,6 @@ def _sparse_mla_fwd_gl_kernel(
     )
 
     # Blocked layouts for global loads.
-    #
-    # blk_qlora: this layout is used as the source of an async
-    # buffer_load_to_shared for Q_lora. The CDNA4 direct-to-LDS lowering
-    # (BufferLoadToLocalOpConversion → canLoadDirectToLDS) requires the
-    # warp's per-tile coalesced span along the contiguous dim to *equal*
-    # the tensor's inner dim (`vec * threadsPerWarp_along_contig == innerDim`),
-    # otherwise `canCoalesceWriteIntoSharedMemory` fails and the op is
-    # left unlowered (manifests as `unrealized_conversion_cast` translation
-    # failure). Concretely we need `size_per_thread[1] * threads_per_warp[1]
-    # == D_V`. We keep `size_per_thread[1] = 8` so each LDS write is 128
-    # bits (the only width supported by ds_load_tr at bf16 besides 32).
-    # Note this layout is also reused for the O write epilogue (sync
-    # buffer_store), which is not subject to the same constraint.
     _qlora_tpw_k: gl.constexpr = min(64, D_V // 8)
     _qlora_tpw_m: gl.constexpr = 64 // _qlora_tpw_k
     blk_qlora: gl.constexpr = gl.BlockedLayout(
@@ -146,15 +110,15 @@ def _sparse_mla_fwd_gl_kernel(
         warps_per_cta=[4], order=[0],
     )
 
-    # Shared layouts
-    sh_qlora: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=1, max_phase=16, order=[1, 0],
+    # Shared layouts.
+    sh_qlora: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]], [BLOCK_H, D_V], [1, 0],
     )
     sh_qrope: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=2, max_phase=8, order=[1, 0],
     )
-    sh_klora: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=1, max_phase=16, order=[0, 1],
+    sh_klora: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]], [D_V, TILE_K], [0, 1],
     )
     sh_krope: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=2, max_phase=8, order=[0, 1],
@@ -199,10 +163,6 @@ def _sparse_mla_fwd_gl_kernel(
     )
     q_mask_rope = mask_h_qrope[:, None]
 
-    # Stage Q_lora and Q_rope directly to shared via async DMA. Committed as one
-    # group so it can overlap with the K_rope tile-0 issue below. We keep the
-    # dot-operand-layout views (Q_lora_dot, Q_rope_dot) in registers for the
-    # entire loop; those are loaded after the K_rope tile-0 commit + wait_group.
     smem_qlora = gl.allocate_shared_memory(Q_ptr.dtype.element_ty, [BLOCK_H, D_V],  layout=sh_qlora)
     smem_qrope = gl.allocate_shared_memory(Q_ptr.dtype.element_ty, [BLOCK_H, D_ROPE], layout=sh_qrope)
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -315,10 +275,6 @@ def _sparse_mla_fwd_gl_kernel(
     )
     gl.amd.cdna4.async_copy.commit_group()
 
-    # Two groups in flight: [Q (older), K_rope tile 0 (newer)]. Wait until at
-    # most 1 remains → Q is in shared. Convert Q to dot-operand layout once and
-    # keep in regs for the entire loop. K_rope tile 0 stays in flight; the
-    # loop's wait_group(1) will retire it on iter 0.
     gl.amd.cdna4.async_copy.wait_group(1)
     Q_lora_dot = smem_qlora.load(dot_qlora_a)
     Q_rope_dot = smem_qrope.load(dot_qrope_a)
@@ -417,10 +373,6 @@ def _sparse_mla_fwd_gl_kernel(
         l_new = alpha * l_i + gl.sum(P, axis=1)
 
         # acc = acc * alpha + P @ V_lora
-        acc_alpha = gl.convert_layout(alpha[:, None], gl.SliceLayout(1, mfma_acc).parent)
-        # The above might fail; do it via broadcast and convert_layout instead:
-        # alpha is fp32 in SliceLayout(1, mfma_s); we need to apply per-row scaling on acc (mfma_acc).
-        # Simpler: scale in mfma_acc layout by reusing the same vector but converted.
         alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
         acc = acc * alpha_acc[:, None]
 
