@@ -20,13 +20,17 @@ Layouts (extracted from the .ttgir):
 MFMA instruction (from amdgcn): v_mfma_f32_16x16x16_bf16 for both dots.
 
 Pipeline:
-  Prologue:  load Q_lora, Q_rope into shared, load K_rope tile 0 (async DMA), load K_lora tile 0 (registers).
-  Loop body for tile t (1..N-1):
-    - wait K_rope tile t-1
-    - prefetch next-tile topk_pos and K_rope (async DMA), K_lora (registers)
-    - run S = Q_lora @ K_lora_T + Q_rope @ K_rope_T (current)
-    - softmax update + acc += P @ V_lora (V_lora = trans(K_lora_T) via shared)
-  Epilogue: process the last tile, write O and LSE.
+  Prologue:  Q_lora + Q_rope → shared via async DMA (group A).
+             K_lora tile 0 + K_rope tile 0 → shared via async DMA (group B, double-buffered).
+             wait_group(1) → Q in shared; load Q dot operands once.
+  Loop body for tile t (0..N-2):
+    - prefetch next-tile topk_pos
+    - K_lora[t+1] + K_rope[t+1] → shared via async DMA (one new group)
+    - wait_group(1)  → K[t] in shared (older group retired)
+    - read K_lora[cur_buf], V_lora[cur_buf] (permute view), K_rope[cur_buf]
+    - S = Q_lora @ K_lora_T + Q_rope @ K_rope_T
+    - softmax update + acc += P @ V_lora
+  Epilogue: wait_group(0) → process last tile, write O and LSE.
 """
 
 import math
@@ -93,17 +97,40 @@ def _sparse_mla_fwd_gl_kernel(
         transposed=True, warps_per_cta=[4, 1],
     )
 
-    # Blocked layouts for global loads
+    # Blocked layouts for global loads.
+    #
+    # blk_qlora: this layout is used as the source of an async
+    # buffer_load_to_shared for Q_lora. The CDNA4 direct-to-LDS lowering
+    # (BufferLoadToLocalOpConversion → canLoadDirectToLDS) requires the
+    # warp's per-tile coalesced span along the contiguous dim to *equal*
+    # the tensor's inner dim (`vec * threadsPerWarp_along_contig == innerDim`),
+    # otherwise `canCoalesceWriteIntoSharedMemory` fails and the op is
+    # left unlowered (manifests as `unrealized_conversion_cast` translation
+    # failure). Concretely we need `size_per_thread[1] * threads_per_warp[1]
+    # == D_V`. We keep `size_per_thread[1] = 8` so each LDS write is 128
+    # bits (the only width supported by ds_load_tr at bf16 besides 32).
+    # Note this layout is also reused for the O write epilogue (sync
+    # buffer_store), which is not subject to the same constraint.
+    _qlora_tpw_k: gl.constexpr = min(64, D_V // 8)
+    _qlora_tpw_m: gl.constexpr = 64 // _qlora_tpw_k
     blk_qlora: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8], threads_per_warp=[1, 64],
+        size_per_thread=[1, 8],
+        threads_per_warp=[_qlora_tpw_m, _qlora_tpw_k],
         warps_per_cta=[4, 1], order=[1, 0],
     )
     blk_qrope: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8], threads_per_warp=[8, 8],
         warps_per_cta=[4, 1], order=[1, 0],
     )
-    blk_klora: gl.constexpr = gl.BlockedLayout(   # [D_V, TILE_K] = [512, 16]
-        size_per_thread=[8, 1], threads_per_warp=[64, 1],
+    # blk_klora: source of an async buffer_load_to_shared for K_lora (order=[0,1] →
+    # dim 0 = D_V is contiguous). Same CDNA4 coalesced-write constraint as blk_qlora:
+    # `size_per_thread[0] * threads_per_warp[0] == D_V`. Keep size_per_thread[0]=8 so
+    # each LDS write is 128 bits.
+    _klora_tpw_m: gl.constexpr = min(64, D_V // 8)
+    _klora_tpw_n: gl.constexpr = 64 // _klora_tpw_m
+    blk_klora: gl.constexpr = gl.BlockedLayout(   # [D_V, TILE_K]
+        size_per_thread=[8, 1],
+        threads_per_warp=[_klora_tpw_m, _klora_tpw_n],
         warps_per_cta=[1, 4], order=[0, 1],
     )
     blk_krope: gl.constexpr = gl.BlockedLayout(   # [D_ROPE, TILE_K] = [64, 16]
@@ -160,10 +187,6 @@ def _sparse_mla_fwd_gl_kernel(
     )
     q_mask_lora = mask_h_qlora[:, None]
 
-    Q_lora_reg = gl.amd.cdna4.buffer_load(
-        ptr=Q_ptr, offsets=q_offs_lora.to(tl.int32), mask=q_mask_lora,
-    )
-
     # Q_rope  [BLOCK_H, D_ROPE]
     offs_h_qrope = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blk_qrope))
     offs_r_qrope = gl.arange(0, D_ROPE, layout=gl.SliceLayout(0, blk_qrope))
@@ -176,19 +199,25 @@ def _sparse_mla_fwd_gl_kernel(
     )
     q_mask_rope = mask_h_qrope[:, None]
 
-    Q_rope_reg = gl.amd.cdna4.buffer_load(
-        ptr=Q_ptr, offsets=q_offs_rope.to(tl.int32), mask=q_mask_rope,
-    )
-
-    # Stage Q_lora and Q_rope into shared, then load to dot operand layouts so we can
-    # convert layouts cheaply. We keep them in registers in the dot operand layout for
-    # the entire loop.
+    # Stage Q_lora and Q_rope directly to shared via async DMA. Committed as one
+    # group so it can overlap with the K_rope tile-0 issue below. We keep the
+    # dot-operand-layout views (Q_lora_dot, Q_rope_dot) in registers for the
+    # entire loop; those are loaded after the K_rope tile-0 commit + wait_group.
     smem_qlora = gl.allocate_shared_memory(Q_ptr.dtype.element_ty, [BLOCK_H, D_V],  layout=sh_qlora)
     smem_qrope = gl.allocate_shared_memory(Q_ptr.dtype.element_ty, [BLOCK_H, D_ROPE], layout=sh_qrope)
-    smem_qlora.store(Q_lora_reg)
-    smem_qrope.store(Q_rope_reg)
-    Q_lora_dot = smem_qlora.load(dot_qlora_a)
-    Q_rope_dot = smem_qrope.load(dot_qrope_a)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        dest=smem_qlora,
+        ptr=Q_ptr,
+        offsets=q_offs_lora.to(tl.int32),
+        mask=q_mask_lora,
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        dest=smem_qrope,
+        ptr=Q_ptr,
+        offsets=q_offs_rope.to(tl.int32),
+        mask=q_mask_rope,
+    )
+    gl.amd.cdna4.async_copy.commit_group()
 
     # ---------- topk and KV offsets ----------
     NUM_TILES: gl.constexpr = (TOPK + TILE_K - 1) // TILE_K
@@ -215,16 +244,13 @@ def _sparse_mla_fwd_gl_kernel(
     smem_krope = gl.allocate_shared_memory(
         KV_ptr.dtype.element_ty, [2, D_ROPE, TILE_K], layout=sh_krope,
     )
-    # K_lora needs shared mem twice: once as dot operand 1 (S), once transposed
-    # (V_lora) as dot operand 1 of the acc dot. We use one shared buffer and read it
-    # back in two different layouts each tile.
+    # K_lora is double-buffered (parallels K_rope). We async-DMA each tile into
+    # smem_klora.index(buf), then read the current buffer twice: once as opIdx=1
+    # of mfma_s (S dot) and once permuted to [TILE_K, D_V] as opIdx=1 of mfma_acc
+    # (V_lora dot). The permute is a memdesc view — no data movement.
     smem_klora = gl.allocate_shared_memory(
-        KV_ptr.dtype.element_ty, [D_V, TILE_K], layout=sh_klora,
+        KV_ptr.dtype.element_ty, [2, D_V, TILE_K], layout=sh_klora,
     )
-    # V_lora = trans(K_lora_T)  → we load K_lora once into a [D_V, TILE_K] shared
-    # buffer with order=[0,1], and view it as a [TILE_K, D_V] memdesc by permuting
-    # the dimensions; reading the permuted view yields the transposed tensor in
-    # registers.
 
     # ---------- accumulators ----------
     m_i = gl.full([BLOCK_H], float("-inf"), dtype=gl.float32,
@@ -255,24 +281,27 @@ def _sparse_mla_fwd_gl_kernel(
         mask=offs_tile_mma < TOPK, other=-1,
     )
 
-    valid_klora = (topk_pos_klora != -1)  # tile_start=0 ⇒ offs_tile<TOPK already true
+    valid_klora = (topk_pos_klora != -1)  # tile_start=0 -> offs_tile<TOPK already true
     valid_krope = (topk_pos_krope != -1)
     valid_mma = (topk_pos_mma != -1)
 
     safe_klora = gl.where(valid_klora, topk_pos_klora, 0)
     safe_krope = gl.where(valid_krope, topk_pos_krope, 0)
 
-    # K_lora load (registers)
+    # K_lora async DMA into smem_klora[0]
     klora_offs = (
         safe_klora[None, :].to(tl.int64) * stride_kv_t
         + offs_v_klora[:, None].to(tl.int64)
     )
-    K_lora_T_reg = gl.amd.cdna4.buffer_load(
-        ptr=KV_ptr, offsets=klora_offs.to(tl.int32),
+    klora_smem0 = smem_klora.index(0)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        dest=klora_smem0,
+        ptr=KV_ptr,
+        offsets=klora_offs.to(tl.int32),
         mask=valid_klora[None, :],
     )
 
-    # K_rope async DMA into smem_krope[0]
+    # K_rope async DMA into smem_krope[0] — same group as K_lora.
     krope_offs = (
         safe_krope[None, :].to(tl.int64) * stride_kv_t
         + (D_V + offs_r_krope[:, None]).to(tl.int64)
@@ -285,6 +314,14 @@ def _sparse_mla_fwd_gl_kernel(
         mask=valid_krope[None, :],
     )
     gl.amd.cdna4.async_copy.commit_group()
+
+    # Two groups in flight: [Q (older), K_rope tile 0 (newer)]. Wait until at
+    # most 1 remains → Q is in shared. Convert Q to dot-operand layout once and
+    # keep in regs for the entire loop. K_rope tile 0 stays in flight; the
+    # loop's wait_group(1) will retire it on iter 0.
+    gl.amd.cdna4.async_copy.wait_group(1)
+    Q_lora_dot = smem_qlora.load(dot_qlora_a)
+    Q_rope_dot = smem_qrope.load(dot_qrope_a)
 
     # ---------- main loop: prefetch t+1, compute t ----------
     cur_buf = 0
@@ -315,22 +352,26 @@ def _sparse_mla_fwd_gl_kernel(
         safe_klora_next = gl.where(valid_klora_next, topk_pos_klora_next, 0)
         safe_krope_next = gl.where(valid_krope_next, topk_pos_krope_next, 0)
 
-        # K_lora_next load (registers)
+        # K_lora_next + K_rope_next async DMA, both into the next buffer slot,
+        # committed as a single group so the loop's wait_group(1) retires both at once.
+        next_buf = 1 - cur_buf
+
         klora_offs_next = (
             safe_klora_next[None, :].to(tl.int64) * stride_kv_t
             + offs_v_klora[:, None].to(tl.int64)
         )
-        K_lora_T_next_reg = gl.amd.cdna4.buffer_load(
-            ptr=KV_ptr, offsets=klora_offs_next.to(tl.int32),
+        klora_smem_next = smem_klora.index(next_buf)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            dest=klora_smem_next,
+            ptr=KV_ptr,
+            offsets=klora_offs_next.to(tl.int32),
             mask=valid_klora_next[None, :],
         )
 
-        # K_rope_next async DMA into smem_krope[1 - cur_buf]
         krope_offs_next = (
             safe_krope_next[None, :].to(tl.int64) * stride_kv_t
             + (D_V + offs_r_krope[:, None]).to(tl.int64)
         )
-        next_buf = 1 - cur_buf
         krope_smem_next = smem_krope.index(next_buf)
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             dest=krope_smem_next,
@@ -345,11 +386,11 @@ def _sparse_mla_fwd_gl_kernel(
         gl.amd.cdna4.async_copy.wait_group(1)
 
         # ---------- compute current tile ----------
-        # Stage current K_lora into shared and load both dot-operand and transposed views.
-        smem_klora.store(K_lora_T_reg)
-        K_lora_T_dot = smem_klora.load(dot_klora_b)            # opIdx=1 of mfma_s
-        # V_lora = transpose: view smem as [TILE_K, D_V] then load with opIdx=1 of mfma_acc.
-        V_lora_dot = smem_klora.permute([1, 0]).load(dot_v_b)  # opIdx=1 of mfma_acc
+        # Read K_lora from current shared buffer in two views: dot-operand and
+        # transposed (V_lora). The permute is a memdesc view — no data movement.
+        klora_smem_cur = smem_klora.index(cur_buf)
+        K_lora_T_dot = klora_smem_cur.load(dot_klora_b)              # opIdx=1 of mfma_s
+        V_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)    # opIdx=1 of mfma_acc
 
         # Load K_rope from smem (current buffer).
         krope_smem_cur = smem_krope.index(cur_buf)
@@ -392,7 +433,6 @@ def _sparse_mla_fwd_gl_kernel(
 
         # Promote prefetched values to "current"
         cur_buf = next_buf
-        K_lora_T_reg = K_lora_T_next_reg
         topk_pos_klora = topk_pos_klora_next
         topk_pos_krope = topk_pos_krope_next
         topk_pos_mma = topk_pos_mma_next
@@ -405,9 +445,9 @@ def _sparse_mla_fwd_gl_kernel(
     # ---------- epilogue: process the last tile (NUM_TILES-1) ----------
     gl.amd.cdna4.async_copy.wait_group(0)
 
-    smem_klora.store(K_lora_T_reg)
-    K_lora_T_dot = smem_klora.load(dot_klora_b)
-    V_lora_dot = smem_klora.permute([1, 0]).load(dot_v_b)
+    klora_smem_cur = smem_klora.index(cur_buf)
+    K_lora_T_dot = klora_smem_cur.load(dot_klora_b)
+    V_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)
     krope_smem_cur = smem_krope.index(cur_buf)
     K_rope_T_dot = krope_smem_cur.load(dot_krope_b)
 
