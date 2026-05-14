@@ -1,24 +1,4 @@
 """
-Layouts (extracted from the .ttgir):
-  - Q_lora    [64, 512]  -> #blocked3 (sizePerThread=[1,8], threadsPerWarp=[1,64], warpsPerCTA=[4,1], order=[1,0])
-                            stored to #shared (vec=8, perPhase=1, maxPhase=16, order=[1,0])
-                            loaded as DotOperand opIdx=0 of #mma (k_width=8)
-  - Q_rope    [64, 64]   -> #blocked2 (sizePerThread=[1,8], threadsPerWarp=[8,8], warpsPerCTA=[4,1], order=[1,0])
-                            stored to #shared1 (vec=8, perPhase=2, maxPhase=8, order=[1,0])
-                            loaded as DotOperand opIdx=0 of #mma (k_width=8)
-  - K_lora_T  [512, 16]  -> #blocked1 (sizePerThread=[8,1], threadsPerWarp=[64,1], warpsPerCTA=[1,4], order=[0,1])
-                            stored to #shared3 (vec=8, perPhase=1, maxPhase=16, order=[0,1])
-                            loaded as DotOperand opIdx=1 of #mma (k_width=8)
-                            also transposed and used as V_lora [16, 512] via #shared4
-                            (vec=4, perPhase=1, maxPhase=16, order=[1,0]) → opIdx=1 of #mma1 (k_width=4)
-  - K_rope_T  [64, 16]   -> #blocked  (sizePerThread=[2,1], threadsPerWarp=[32,2], warpsPerCTA=[1,4], order=[0,1])
-                            stored to #shared2 (vec=8, perPhase=2, maxPhase=8, order=[0,1]) — double-buffered
-                            loaded as DotOperand opIdx=1 of #mma (k_width=8)
-  - S         [64, 16]   -> #mma  (instr_shape=[16,16,16], warps_per_cta=[4,1], transposed=True)
-  - acc       [64, 512]  -> #mma1 (instr_shape=[16,16,16], warps_per_cta=[4,1], transposed=True)
-
-MFMA instruction (from amdgcn): v_mfma_f32_16x16x16_bf16 for both dots.
-
 Pipeline:
   Prologue:  Q_lora + Q_rope → shared via async DMA (group A).
              K_lora tile 0 + K_rope tile 0 → shared via async DMA (group B, double-buffered).
@@ -26,7 +6,7 @@ Pipeline:
   Loop body for tile t (0..N-2):
     - prefetch next-tile topk_pos
     - K_lora[t+1] + K_rope[t+1] → shared via async DMA (one new group)
-    - wait_group(1)  → K[t] in shared (older group retired)
+    - wait_group(1) -> K[t] in shared (older group retired)
     - read K_lora[cur_buf], V_lora[cur_buf] (permute view), K_rope[cur_buf]
     - S = Q_lora @ K_lora_T + Q_rope @ K_rope_T
     - softmax update + acc += P @ V_lora
@@ -43,6 +23,67 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 
+# =====================================================================
+# Utility
+# =====================================================================
+def _get_lds_limit():
+    """Return the per-CU LDS limit in bytes for the current GPU.
+
+    gfx942 (MI300X): 64 KB = 65536 bytes
+    gfx950 (MI355X): 160 KB = 163840 bytes
+    """
+    if torch.cuda.is_available():
+        prop = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(prop, "gcnArchName", "")
+        if "gfx950" in gcn_arch:
+            return 163840
+    return 65536
+
+
+_LDS_LIMIT = _get_lds_limit()
+
+
+# =====================================================================
+# Forward — autotune configs and pruning
+# =====================================================================
+def _fwd_prune_configs(configs, named_args, **kwargs):
+    """Prune autotune configs that would exceed per-CU LDS."""
+    D_V = kwargs.get("D_V", named_args.get("D_V"))
+    D_ROPE = kwargs.get("D_ROPE", named_args.get("D_ROPE"))
+    pruned = []
+    for config in configs:
+        bh = config.kwargs["BLOCK_H"]
+        tk = config.kwargs["TILE_K"]
+        ns = config.num_stages
+        kv_lds = (D_V + D_ROPE) * tk * 2 * ns
+        if kv_lds <= _LDS_LIMIT:
+            pruned.append(config)
+    if not pruned:
+        pruned.append(configs[0])
+    return pruned
+
+
+def _get_fwd_autotune_configs():
+    configs = [
+        triton.Config(
+            {"BLOCK_H": BLOCK_H, "TILE_K": TILE_K,
+             "waves_per_eu": WPE},
+            num_warps=nw,
+        )
+        for BLOCK_H in [16, 32, 64]
+        for TILE_K in [16, 32, 64, 128]
+        for WPE in [0, 1, 2]
+        for nw in [4]   # num_warps must be 4 to align with kernel implementation
+    ]
+    # configs = [triton.Config({"BLOCK_H": 64, "TILE_K": 32, "waves_per_eu": 0}, num_warps=4),]
+    return configs
+
+
+@triton.autotune(
+    configs=_get_fwd_autotune_configs(),
+    key=["num_heads", "TOPK", "D_V", "D_ROPE"],
+    prune_configs_by={"early_config_prune": _fwd_prune_configs},
+)
 @gluon.jit
 def _sparse_mla_fwd_gl_kernel(
     Q_ptr,          # [total_tokens, num_heads, D_QK] bf16
@@ -86,10 +127,7 @@ def _sparse_mla_fwd_gl_kernel(
         size_per_thread=[1, 8], threads_per_warp=[8, 8],
         warps_per_cta=[4, 1], order=[1, 0],
     )
-    # blk_klora: source of an async buffer_load_to_shared for K_lora (order=[0,1] →
-    # dim 0 = D_V is contiguous). Same CDNA4 coalesced-write constraint as blk_qlora:
-    # `size_per_thread[0] * threads_per_warp[0] == D_V`. Keep size_per_thread[0]=8 so
-    # each LDS write is 128 bits.
+
     _klora_tpw_m: gl.constexpr = min(64, D_V // 8)
     _klora_tpw_n: gl.constexpr = 64 // _klora_tpw_m
     blk_klora: gl.constexpr = gl.BlockedLayout(   # [D_V, TILE_K]
@@ -200,14 +238,9 @@ def _sparse_mla_fwd_gl_kernel(
     )
 
     # ---------- shared mem allocations for the K loop ----------
-    # K_rope is double-buffered exactly like Triton's ttgir.
     smem_krope = gl.allocate_shared_memory(
         KV_ptr.dtype.element_ty, [2, D_ROPE, TILE_K], layout=sh_krope,
     )
-    # K_lora is double-buffered (parallels K_rope). We async-DMA each tile into
-    # smem_klora.index(buf), then read the current buffer twice: once as opIdx=1
-    # of mfma_s (S dot) and once permuted to [TILE_K, D_V] as opIdx=1 of mfma_acc
-    # (V_lora dot). The permute is a memdesc view — no data movement.
     smem_klora = gl.allocate_shared_memory(
         KV_ptr.dtype.element_ty, [2, D_V, TILE_K], layout=sh_klora,
     )
@@ -221,13 +254,6 @@ def _sparse_mla_fwd_gl_kernel(
 
     # ---------- tile-0 prefetch (prologue) ----------
     # Load K_lora and K_rope for tile 0.
-    valid0_klora = (topk_pos_reg != -1) & (offs_tile_topk < TOPK)
-    # Cast valid masks into the layouts of the K loaders.
-    # We'll just rebuild per-loader masks using the per-loader offs_tile and a
-    # per-loader topk_pos (loaded with the same blocked layout).
-    # To avoid extra TopK loads, we re-express by recomputing topk_pos per
-    # blocked layout: use convert_layout where possible, or reload from memory.
-    # Reload per-layout is the simplest and matches what the Triton IR actually does.
     topk_pos_klora = gl.amd.cdna4.buffer_load(
         ptr=TopK_ptr, offsets=topk_base.to(tl.int32) + offs_tile_klora,
         mask=offs_tile_klora < TOPK, other=-1,
@@ -504,13 +530,8 @@ def sparse_mla_fwd_gl(q, kv, topk_indices, kv_lora_rank=512, scale=None):
     o = torch.empty(total_tokens, num_heads, kv_lora_rank, dtype=q.dtype, device=q.device)
     lse = torch.empty(total_tokens, num_heads, dtype=torch.float32, device=q.device)
 
-    # Hard-coded best config (matches Triton autotune winner).
-    BLOCK_H = 64
-    TILE_K = 16
-    num_warps = 4
-    num_stages = 2  # informational; we have an explicit pipeline
-
-    grid = (total_tokens, triton.cdiv(num_heads, BLOCK_H))
+    # Grid is autotune-aware: BLOCK_H comes from the chosen config.
+    grid = lambda META: (total_tokens, triton.cdiv(num_heads, META["BLOCK_H"]))
 
     _sparse_mla_fwd_gl_kernel[grid](
         Q_ptr=q, KV_ptr=kv, TopK_ptr=topk_indices,
@@ -520,9 +541,8 @@ def sparse_mla_fwd_gl(q, kv, topk_indices, kv_lora_rank=512, scale=None):
         stride_o_t=o.stride(0), stride_o_h=o.stride(1),
         stride_topk_t=topk_indices.stride(0),
         scale=scale, num_heads=num_heads,
-        TOPK=topk, BLOCK_H=BLOCK_H, TILE_K=TILE_K,
+        TOPK=topk,
         D_V=kv_lora_rank, D_ROPE=rope_rank,
-        num_warps=num_warps,
     )
 
     return o, lse
@@ -551,9 +571,6 @@ def verify_correctness():
 
     diff = (o_gl.float() - o_ref.float()).abs()
     err_o_abs = diff.max().item()
-    # Two relative-error views, gated by ref magnitude to avoid blowup near zero.
-    # bf16 has ~3-4 decimal digits, so for outputs in the 0.01-0.1 range a 1-2%
-    # difference between two MFMA pipelines is normal.
     sig_lo = o_ref.float().abs() > 1e-2
     sig_hi = o_ref.float().abs() > 1e-1
     err_o_rel_lo = (diff[sig_lo] / o_ref.float().abs()[sig_lo]).max().item() if sig_lo.any() else 0.0

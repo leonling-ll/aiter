@@ -32,6 +32,13 @@ from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import
     sparse_mla_train,
 )
 
+if os.environ.get("USE_GLUON_DSA", "0") == "1":
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.deepseek_sparse_attention import sparse_mla_fwd_gl as sparse_mla_fwd
+    print("[bench_dsa_methods] Using Gluon forward kernel (sparse_mla_fwd_gl)")
+else:
+    sparse_mla_fwd = _sparse_mla_fwd_triton
+    print("[bench_dsa_methods] Using Triton forward kernel (sparse_mla_fwd)")
+
 # "persistent" excluded: Triton/LLVM compilation hangs at D_V=512 (register pressure).
 # See persistent_kernel_postmortem.md. Add manually if testing small D_V configs.
 METHODS = ["fused", "recompute", "split_intermediate", "privatized", "xcd_privatized", "gather", "chunked_gather"]
@@ -308,6 +315,8 @@ def main():
             # (1, 4096, 128, 512, 64, 2048),
             # (1, 8192, 128, 512, 64, 1024),
             (1, 8192, 128, 512, 64, 2048),
+            # (1, 4096, 32, 512, 64, 1024),
+            # (1, 4096, 16, 512, 64, 1024),
         ]
         for cfg in fwd_configs:
             try:

@@ -91,16 +91,16 @@ def _fwd_prune_configs(configs, named_args, **kwargs):
 
 
 def _get_fwd_autotune_configs():
-    # configs = [
-    #     triton.Config({"BLOCK_H": BLOCK_H, "TILE_K": TILE_K, "waves_per_eu": WPE, "matrix_instr_nonkdim": NKDIM}, num_warps=nw, num_stages=ns)
-    #     for BLOCK_H in [16, 32, 64]
-    #     for TILE_K in [16, 32, 64, 128]
-    #     for WPE in [0, 1, 2]
-    #     for NKDIM in [16, 32]
-    #     for nw in [4, 8]
-    #     for ns in [1, 2]
-    # ]
-    configs = [triton.Config({"BLOCK_H": 64, "TILE_K": 16, "waves_per_eu": 0, "matrix_instr_nonkdim": 16}, num_warps=4, num_stages=2),]
+    configs = [
+        triton.Config({"BLOCK_H": BLOCK_H, "TILE_K": TILE_K, "waves_per_eu": WPE, "matrix_instr_nonkdim": NKDIM}, num_warps=nw, num_stages=ns)
+        for BLOCK_H in [16, 32, 64]
+        for TILE_K in [16, 32, 64, 128]
+        for WPE in [0, 1, 2]
+        for NKDIM in [16, 32]
+        for nw in [4, 8]
+        for ns in [1, 2]
+    ]
+    # configs = [triton.Config({"BLOCK_H": 64, "TILE_K": 16, "waves_per_eu": 0, "matrix_instr_nonkdim": 16}, num_warps=4, num_stages=2),]
     return configs
 
 
@@ -301,18 +301,13 @@ def _bwd_prune_configs(configs, named_args, **kwargs):
 
 
 def _get_bwd_autotune_configs():
-    configs = []
-    for BLOCK_H in [16, 32, 64]:
-        for TILE_K in [16, 32, 64, 128]:
-            for num_warps in [2, 4, 8, 16]:
-                for num_stages in [1, 2, 3, 4]:
-                    configs.append(
-                        triton.Config(
-                            {"BLOCK_H": BLOCK_H, "TILE_K": TILE_K},
-                            num_warps=num_warps,
-                            num_stages=num_stages,
-                        )
-                    )
+    configs = [
+        triton.Config({"BLOCK_H": BLOCK_H, "TILE_K": TILE_K}, num_warps=nw, num_stages=ns)
+        for BLOCK_H in [16, 32, 64]
+        for TILE_K in [16, 32, 64, 128]
+        for nw in [2, 4, 8, 16]
+        for ns in [1, 2, 3, 4]
+    ]
     return configs
 
 
