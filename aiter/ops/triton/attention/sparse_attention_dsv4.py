@@ -329,40 +329,65 @@ def _sparse_attn_prefill_ragged(
         head_dim, nope_head_dim, rope_head_dim, "sparse_attn_prefill"
     )
 
-    block_h = 16
     block_d = triton.next_power_of_2(head_dim)
-    block_k = 16 if head_dim >= 256 else 32
     out = torch.empty_like(q, dtype=torch.bfloat16)
-    kernel = (
-        _gluon_sparse_attn_prefill_ragged_kernel
-        if _gluon_sparse_attn_prefill_ragged_kernel is not None
-        else _sparse_attn_prefill_ragged_kernel
-    )
-    kernel[(num_queries, triton.cdiv(num_heads, block_h))](
-        q,
-        kv,
-        indices,
-        indptr,
-        attn_sink,
-        out,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        kv.stride(0),
-        kv.stride(1),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        num_heads,
-        head_dim,
-        kv.shape[0],
-        float(scale),
-        HAS_ATTN_SINK=has_attn_sink,
-        BLOCK_H=block_h,
-        BLOCK_D=block_d,
-        BLOCK_K=block_k,
-        num_warps=8,
-    )
+    if _gluon_sparse_attn_prefill_ragged_kernel is not None:
+        block_h = 16
+        block_k = 16 if head_dim >= 256 else 32
+        _gluon_sparse_attn_prefill_ragged_kernel[
+            (num_queries, triton.cdiv(num_heads, block_h))
+        ](
+            q,
+            kv,
+            indices,
+            indptr,
+            attn_sink,
+            out,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            kv.stride(0),
+            kv.stride(1),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            num_heads,
+            head_dim,
+            kv.shape[0],
+            float(scale),
+            HAS_ATTN_SINK=has_attn_sink,
+            BLOCK_H=block_h,
+            BLOCK_D=block_d,
+            BLOCK_K=block_k,
+            num_warps=8,
+        )
+    else:
+        grid = lambda META: (  # noqa: E731
+            num_queries,
+            triton.cdiv(num_heads, META["BLOCK_H"]),
+        )
+        _sparse_attn_prefill_ragged_kernel[grid](
+            q,
+            kv,
+            indices,
+            indptr,
+            attn_sink,
+            out,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            kv.stride(0),
+            kv.stride(1),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            num_heads,
+            head_dim,
+            kv.shape[0],
+            float(scale),
+            HAS_ATTN_SINK=has_attn_sink,
+            BLOCK_D=block_d,
+        )
     return out
 
 
@@ -466,51 +491,83 @@ def _sparse_attn_decode_ragged(
         extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
-    block_h = 16
-    block_k = 16 if head_dim >= 256 else 32
     out = torch.empty_like(q, dtype=torch.bfloat16)
     can_use_gluon = (
         _gluon_sparse_attn_decode_ragged_kernel is not None
         and _use_gluon_decode_for_cache(main_cache)
         and _use_gluon_decode_for_cache(extra_cache)
     )
-    kernel = (
-        _gluon_sparse_attn_decode_ragged_kernel
-        if can_use_gluon
-        else _sparse_attn_decode_ragged_kernel
-    )
-    kernel[(num_queries, triton.cdiv(num_heads, block_h))](
-        q,
-        main_cache,
-        main_indices,
-        main_indptr,
-        extra_cache,
-        extra_indices,
-        extra_indptr,
-        attn_sink,
-        out,
-        q.stride(0),
-        q.stride(1),
-        out.stride(0),
-        out.stride(1),
-        main_cache.stride(0),
-        extra_cache.stride(0),
-        main_cache.shape[0] * main_cache.shape[1],
-        extra_cache.shape[0] * extra_cache.shape[1],
-        main_cache.shape[1],
-        extra_cache.shape[1],
-        scale,
-        num_heads,
-        HAS_ATTN_SINK=has_attn_sink,
-        HAS_EXTRA=has_extra,
-        NOPE_DIM=nope_head_dim,
-        NOPE_BLOCK=triton.next_power_of_2(nope_head_dim),
-        ROPE_DIM=rope_head_dim,
-        IS_FNUZ=_is_fp8_fnuz(),
-        BLOCK_H=block_h,
-        BLOCK_K=block_k,
-        num_warps=8,
-    )
+    if can_use_gluon:
+        block_h = 16
+        block_k = 16 if head_dim >= 256 else 32
+        _gluon_sparse_attn_decode_ragged_kernel[
+            (num_queries, triton.cdiv(num_heads, block_h))
+        ](
+            q,
+            main_cache,
+            main_indices,
+            main_indptr,
+            extra_cache,
+            extra_indices,
+            extra_indptr,
+            attn_sink,
+            out,
+            q.stride(0),
+            q.stride(1),
+            out.stride(0),
+            out.stride(1),
+            main_cache.stride(0),
+            extra_cache.stride(0),
+            main_cache.shape[0] * main_cache.shape[1],
+            extra_cache.shape[0] * extra_cache.shape[1],
+            main_cache.shape[1],
+            extra_cache.shape[1],
+            scale,
+            num_heads,
+            HAS_ATTN_SINK=has_attn_sink,
+            HAS_EXTRA=has_extra,
+            NOPE_DIM=nope_head_dim,
+            NOPE_BLOCK=triton.next_power_of_2(nope_head_dim),
+            ROPE_DIM=rope_head_dim,
+            IS_FNUZ=_is_fp8_fnuz(),
+            BLOCK_H=block_h,
+            BLOCK_K=block_k,
+            num_warps=8,
+        )
+    else:
+        grid = lambda META: (  # noqa: E731
+            num_queries,
+            triton.cdiv(num_heads, META["BLOCK_H"]),
+        )
+        _sparse_attn_decode_ragged_kernel[grid](
+            q,
+            main_cache,
+            main_indices,
+            main_indptr,
+            extra_cache,
+            extra_indices,
+            extra_indptr,
+            attn_sink,
+            out,
+            q.stride(0),
+            q.stride(1),
+            out.stride(0),
+            out.stride(1),
+            main_cache.stride(0),
+            extra_cache.stride(0),
+            main_cache.shape[0] * main_cache.shape[1],
+            extra_cache.shape[0] * extra_cache.shape[1],
+            main_cache.shape[1],
+            extra_cache.shape[1],
+            scale,
+            num_heads,
+            HAS_ATTN_SINK=has_attn_sink,
+            HAS_EXTRA=has_extra,
+            NOPE_DIM=nope_head_dim,
+            NOPE_BLOCK=triton.next_power_of_2(nope_head_dim),
+            ROPE_DIM=rope_head_dim,
+            IS_FNUZ=_is_fp8_fnuz(),
+        )
     return out
 
 

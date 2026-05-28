@@ -30,8 +30,75 @@ kernels consume. They handle the global-topk → block-table indirection
 and the topk+SWA per-token interleaving on the prefill path.
 """
 
+import torch
 import triton
 import triton.language as tl
+
+# =====================================================================
+# Utility
+# =====================================================================
+
+def _get_lds_limit():
+    """Return the per-CU LDS limit in bytes for the current GPU.
+
+    gfx942 (MI300X): 64 KB = 65536 bytes
+    gfx950 (MI355X): 160 KB = 163840 bytes
+    """
+    if torch.cuda.is_available():
+        prop = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(prop, "gcnArchName", "")
+        if "gfx950" in gcn_arch:
+            return 163840
+    return 65536
+
+
+_LDS_LIMIT = _get_lds_limit()
+
+
+# ---------------------------------------------------------------------------
+# Autotune configs for the prefill attention kernels
+# ---------------------------------------------------------------------------
+
+
+def _prefill_prune_configs(configs, named_args, **kwargs):
+    """Prune prefill configs that would exceed per-CU LDS.
+
+    The KV tile loaded into LDS is ``[BLOCK_K, BLOCK_D]`` bf16 (2 B/elem),
+    double-buffered across ``num_stages``.
+    """
+    BLOCK_D = kwargs.get("BLOCK_D", named_args.get("BLOCK_D"))
+    pruned = []
+    for cfg in configs:
+        bk = cfg.kwargs["BLOCK_K"]
+        ns = cfg.num_stages
+        kv_lds = BLOCK_D * bk * 2 * ns
+        if kv_lds <= _LDS_LIMIT:
+            pruned.append(cfg)
+    if not pruned:
+        pruned.append(configs[0])
+    return pruned
+
+
+def _get_prefill_autotune_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_H": BLOCK_H,
+                "BLOCK_K": BLOCK_K,
+                "waves_per_eu": WPE,
+                "matrix_instr_nonkdim": NKDIM,
+            },
+            num_warps=nw,
+            num_stages=ns,
+        )
+        for BLOCK_H in [16, 32, 64]
+        for BLOCK_K in [16, 32, 64, 128]
+        for WPE in [0, 1, 2]
+        for NKDIM in [16, 32]
+        for nw in [4, 8]
+        for ns in [1, 2]
+        # triton.Config({"BLOCK_H": 64, "BLOCK_K": 32, "waves_per_eu": 2, "matrix_instr_nonkdim": 16}, num_warps=4, num_stages=2),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -234,14 +301,19 @@ def _combine_topk_swa_indices_ragged_kernel(
 # ---------------------------------------------------------------------------
 
 
+@triton.autotune(
+    configs=_get_prefill_autotune_configs(),
+    key=["num_heads", "head_dim", "HAS_ATTN_SINK"],
+    prune_configs_by={"early_config_prune": _prefill_prune_configs},
+)
 @triton.jit
 def _sparse_attn_prefill_ragged_kernel(
-    q_ptr,
-    kv_ptr,
-    kv_indices_ptr,
-    kv_indptr_ptr,
-    attn_sink_ptr,
-    out_ptr,
+    q_ptr,              # [num_queries, num_heads, head_dim]            bf16
+    kv_ptr,             # [num_kv, head_dim]                            bf16   (flat: SWA + topk concatenated by caller)
+    kv_indices_ptr,     # [nnz]                                         int32  (CSR slot ids into kv_ptr)
+    kv_indptr_ptr,      # [num_queries + 1]                             int32  (CSR row pointers; nnz = indptr[-1])
+    attn_sink_ptr,      # [num_heads]                                   fp32   (only read when HAS_ATTN_SINK)
+    out_ptr,            # [num_queries, num_heads, head_dim]            bf16
     q_stride_t,
     q_stride_h,
     q_stride_d,
@@ -259,6 +331,11 @@ def _sparse_attn_prefill_ragged_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
+    """Sparse MLA prefill (single-kv ragged path).
+
+    Grid: (num_queries, cdiv(num_heads, BLOCK_H))
+    Each program: 1 query token x BLOCK_H heads.
+    """
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
 
@@ -292,14 +369,16 @@ def _sparse_attn_prefill_ragged_kernel(
         valid = in_range & (slot >= 0) & (slot < num_kv)
 
         kv = tl.load(
-            kv_ptr + slot[:, None] * kv_stride_n + dim_offsets[None, :] * kv_stride_d,
+            kv_ptr + slot[:, None] * kv_stride_n +
+            dim_offsets[None, :] * kv_stride_d,
             mask=valid[:, None] & dim_mask[None, :],
             other=0.0,
         )
         kv = tl.where(valid[:, None] & dim_mask[None, :], kv, 0.0)
 
         scores = tl.dot(q, tl.trans(kv)) * scale
-        scores = tl.where(head_mask[:, None] & valid[None, :], scores, float("-inf"))
+        scores = tl.where(head_mask[:, None] &
+                          valid[None, :], scores, float("-inf"))
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
@@ -339,17 +418,65 @@ def _sparse_attn_prefill_ragged_kernel(
     )
 
 
+def _decode_prune_configs(configs, named_args, **kwargs):
+    """Prune decode configs that would exceed per-CU LDS.
+
+    Per tile we cache the NoPE half (FP8 — 1 B/elem) and the RoPE half
+    (bf16 — 2 B/elem) for ``BLOCK_K`` slots, double-buffered across
+    ``num_stages``. The per-64-element FP8 scale group is negligible.
+    """
+    NOPE_DIM = kwargs.get("NOPE_DIM", named_args.get("NOPE_DIM"))
+    ROPE_DIM = kwargs.get("ROPE_DIM", named_args.get("ROPE_DIM"))
+    pruned = []
+    for cfg in configs:
+        bk = cfg.kwargs["BLOCK_K"]
+        ns = cfg.num_stages
+        kv_lds = bk * (NOPE_DIM + 2 * ROPE_DIM) * ns
+        if kv_lds <= _LDS_LIMIT:
+            pruned.append(cfg)
+    if not pruned:
+        pruned.append(configs[0])
+    return pruned
+
+
+def _get_decode_autotune_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_H": BLOCK_H,
+                "BLOCK_K": BLOCK_K,
+                "waves_per_eu": WPE,
+                "matrix_instr_nonkdim": NKDIM,
+            },
+            num_warps=nw,
+            num_stages=ns,
+        )
+        for BLOCK_H in [16, 32, 64]
+        for BLOCK_K in [16, 32, 64, 128]
+        for WPE in [0, 1, 2]
+        for NKDIM in [16]
+        for nw in [4, 8]
+        for ns in [1, 2]
+        # triton.Config({"BLOCK_H": 64, "BLOCK_K": 32, "waves_per_eu": 2, "matrix_instr_nonkdim": 16}, num_warps=4, num_stages=2),
+    ]
+
+
+@triton.autotune(
+    configs=_get_decode_autotune_configs(),
+    key=["num_heads", "NOPE_DIM", "ROPE_DIM", "HAS_ATTN_SINK", "HAS_EXTRA"],
+    prune_configs_by={"early_config_prune": _decode_prune_configs},
+)
 @triton.jit
 def _sparse_attn_decode_ragged_kernel(
-    q_ptr,
-    main_cache_ptr,
-    main_indices_ptr,
-    main_indptr_ptr,
-    extra_cache_ptr,
-    extra_indices_ptr,
-    extra_indptr_ptr,
-    attn_sink_ptr,
-    out_ptr,
+    q_ptr,              # [num_queries, num_heads, NOPE_DIM + ROPE_DIM]                   bf16
+    main_cache_ptr,     # [num_main_blocks, main_block_size * 584]                        uint8  (fp8_ds_mla: 576 B nope+rope, then 8 B scale per token)
+    main_indices_ptr,   # [main_nnz]                                                      int32  (CSR global slot ids into main cache)
+    main_indptr_ptr,    # [num_queries + 1]                                               int32  (CSR row pointers for main / SWA)
+    extra_cache_ptr,    # [num_extra_blocks, extra_block_size * 584]                      uint8  (only read when HAS_EXTRA; same fp8_ds_mla layout)
+    extra_indices_ptr,  # [extra_nnz]                                                     int32  (only read when HAS_EXTRA; CSR global slot ids into extra cache)
+    extra_indptr_ptr,   # [num_queries + 1]                                               int32  (only read when HAS_EXTRA; CSR row pointers for top-k)
+    attn_sink_ptr,      # [num_heads]                                                     fp32   (only read when HAS_ATTN_SINK)
+    out_ptr,            # [num_queries, num_heads, NOPE_DIM + ROPE_DIM]                   bf16
     q_stride0,
     q_stride1,
     out_stride0,
@@ -371,6 +498,13 @@ def _sparse_attn_decode_ragged_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
+    """Sparse MLA decode (paged fp8_ds_mla, dual ragged passes).
+
+    Grid: (num_queries, cdiv(num_heads, BLOCK_H))
+    Each program: 1 query token x BLOCK_H heads. Walks the main / SWA
+    pass first, then (when HAS_EXTRA) the top-k pass, sharing one online
+    softmax statistic across both.
+    """
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
 
@@ -380,7 +514,8 @@ def _sparse_attn_decode_ragged_kernel(
     nope_mask = nope_offsets < NOPE_DIM
     rope_offsets = tl.arange(0, ROPE_DIM)
 
-    q_row_ptr = q_ptr + query_idx * q_stride0 + head_offsets[:, None] * q_stride1
+    q_row_ptr = q_ptr + query_idx * q_stride0 + \
+        head_offsets[:, None] * q_stride1
     q_nope = tl.load(
         q_row_ptr + nope_offsets[None, :],
         mask=head_mask[:, None] & nope_mask[None, :],
@@ -408,13 +543,15 @@ def _sparse_attn_decode_ragged_kernel(
     for k_start in tl.range(0, main_len, BLOCK_K):
         k_pos = k_start + k_offsets
         in_range = k_pos < main_len
-        slot = tl.load(main_indices_ptr + main_start + k_pos, mask=in_range, other=-1)
+        slot = tl.load(main_indices_ptr + main_start +
+                       k_pos, mask=in_range, other=-1)
         valid = in_range & (slot >= 0) & (slot < main_num_rows)
         safe_slot = tl.where(valid, slot, 0)
 
         block_idx = safe_slot // main_block_size
         pos_in_block = safe_slot % main_block_size
-        cache_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
+        cache_block_ptr = main_cache_ptr + \
+            block_idx.to(tl.int64) * main_cache_stride0
         token_data_ptr = cache_block_ptr + pos_in_block * 576
         token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
 
@@ -434,7 +571,8 @@ def _sparse_attn_decode_ragged_kernel(
         )
         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
         k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
-        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+        k_nope = tl.where(
+            valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
         rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
@@ -446,9 +584,11 @@ def _sparse_attn_decode_ragged_kernel(
         k_rope = tl.where(valid[:, None], k_rope, zero_rope)
         k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
-        scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
+        scores = tl.dot(q_nope, tl.trans(k_nope))
+        scores = tl.dot(q_rope, tl.trans(k_rope), scores)
         scores *= scale
-        scores = tl.where(head_mask[:, None] & valid[None, :], scores, float("-inf"))
+        scores = tl.where(head_mask[:, None] &
+                          valid[None, :], scores, float("-inf"))
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
@@ -457,8 +597,10 @@ def _sparse_attn_decode_ragged_kernel(
         p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
-        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+        acc_nope = acc_nope * alpha[:, None] + \
+            tl.dot(p.to(k_nope.dtype), k_nope)
+        acc_rope = acc_rope * alpha[:, None] + \
+            tl.dot(p.to(k_rope.dtype), k_rope)
         m_i = m_new
         l_i = l_new
 
@@ -502,10 +644,12 @@ def _sparse_attn_decode_ragged_kernel(
             )
             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
             k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
-            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+            k_nope = tl.where(
+                valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
-            rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+            rope_ptr = (token_data_ptr +
+                        NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
             k_rope = tl.load(
                 rope_ptr[:, None] + rope_offsets[None, :],
                 mask=valid[:, None],
@@ -519,7 +663,8 @@ def _sparse_attn_decode_ragged_kernel(
                 tl.trans(k_rope),
             )
             scores *= scale
-            scores = tl.where(head_mask[:, None] & valid[None, :], scores, float("-inf"))
+            scores = tl.where(head_mask[:, None] &
+                              valid[None, :], scores, float("-inf"))
 
             m_block = tl.max(scores, axis=1)
             m_new = tl.maximum(m_i, m_block)
@@ -528,8 +673,10 @@ def _sparse_attn_decode_ragged_kernel(
             p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
             l_new = l_i * alpha + tl.sum(p, axis=1)
 
-            acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
-            acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+            acc_nope = acc_nope * alpha[:, None] + \
+                tl.dot(p.to(k_nope.dtype), k_nope)
+            acc_rope = acc_rope * alpha[:, None] + \
+                tl.dot(p.to(k_rope.dtype), k_rope)
             m_i = m_new
             l_i = l_new
 
