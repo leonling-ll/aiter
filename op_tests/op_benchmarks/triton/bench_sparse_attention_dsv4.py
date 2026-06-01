@@ -12,7 +12,14 @@ Usage:
 
 """
 
-from __future__ import annotations
+from aiter.ops.triton.gluon.sparse_attention_dsv4 import (
+    _sparse_attn_decode_kernel as csa_decode_gl,
+    _sparse_attn_prefill_kernel as csa_prefill_gl,
+)
+from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
+    _sparse_attn_decode_kernel as csa_decode_tl,
+    _sparse_attn_prefill_kernel as csa_prefill_tl,
+)
 
 import argparse
 import importlib.util
@@ -22,47 +29,14 @@ import sys
 import torch
 import triton
 
-# def _load_module(name: str, path: str):
-#     spec = importlib.util.spec_from_file_location(name, path)
-#     mod = importlib.util.module_from_spec(spec)
-#     sys.modules[name] = mod
-#     spec.loader.exec_module(mod)
-#     return mod
-
-
-# _AITER_ROOT = os.path.abspath(
-#     os.path.join(os.path.dirname(__file__), "..", "..", "..")
-# )
-# _TRITON_KERNEL_PATH = os.path.join(
-#     _AITER_ROOT,
-#     "aiter/ops/triton/_triton_kernels/attention/sparse_attention_dsv4.py",
-# )
-# _GLUON_KERNEL_PATH = os.path.join(
-#     _AITER_ROOT,
-#     "aiter/ops/triton/_gluon_kernels/gfx950/attention/sparse_attention_dsv4.py",
-# )
-# T = _load_module("_bench_tri_dsv4", _TRITON_KERNEL_PATH)
-# G = _load_module("_bench_gluon_dsv4", _GLUON_KERNEL_PATH)
-
 USE_GLUON = os.environ.get("USE_GLUON", "0") == "1"
 BACKEND = "gluon" if USE_GLUON else "triton"
 
-from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
-    _sparse_attn_decode_kernel as csa_decode_tl,
-    _sparse_attn_prefill_kernel as csa_prefill_tl,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_attention_dsv4 import (
-    _sparse_attn_decode_kernel as csa_decode_gl,
-    _sparse_attn_prefill_kernel as csa_prefill_gl,
-)
 
 sparse_attn_prefill_kernel = csa_prefill_gl if USE_GLUON else csa_prefill_tl
 sparse_attn_decode_kernel = csa_decode_gl if USE_GLUON else csa_decode_tl
 
 
-# ---------------------------------------------------------------------------
-# Realistic DSV4 sparse-MLA test data
-# ---------------------------------------------------------------------------
 NOPE_DIM = 448
 ROPE_DIM = 64
 HEAD_DIM = NOPE_DIM + ROPE_DIM  # 512
@@ -72,6 +46,9 @@ SCALE_BYTES = 8                  # 8 fp8-exp scales per token
 PER_BLOCK_ROW_BYTES = NOPE_BYTES + SCALE_BYTES  # 584
 
 
+# ---------------------------------------------------------------------------
+# Bench data builder
+# ---------------------------------------------------------------------------
 def _build_csr(num_q: int, max_slots: int, max_topk: int, device: str):
     lens = torch.randint(
         max(1, max_topk // 4),
@@ -83,7 +60,8 @@ def _build_csr(num_q: int, max_slots: int, max_topk: int, device: str):
     flat, ptr = [], [0]
     for i in range(num_q):
         L = int(lens[i].item())
-        flat.append(torch.randperm(max_slots, device=device, dtype=torch.int32)[:L])
+        flat.append(torch.randperm(
+            max_slots, device=device, dtype=torch.int32)[:L])
         ptr.append(ptr[-1] + L)
     return torch.cat(flat), torch.tensor(ptr, dtype=torch.int32, device=device), lens
 
@@ -92,15 +70,19 @@ def _build_fp8_cache(num_blocks: int, block_size: int, device: str):
     """Encode bf16 NoPE+RoPE into the 584-byte/row fp8_ds_mla layout the
     decode kernel expects (NoPE fp8 + RoPE bf16 + per-block scale bytes)."""
     total = num_blocks * block_size
-    nope_bf16 = torch.randn(total, NOPE_DIM, dtype=torch.bfloat16, device=device) * 0.3
-    rope_bf16 = torch.randn(total, ROPE_DIM, dtype=torch.bfloat16, device=device) * 0.3
+    nope_bf16 = torch.randn(
+        total, NOPE_DIM, dtype=torch.bfloat16, device=device) * 0.3
+    rope_bf16 = torch.randn(
+        total, ROPE_DIM, dtype=torch.bfloat16, device=device) * 0.3
 
     grp = nope_bf16.float().view(total, NOPE_DIM // 64, 64)
     amax = grp.abs().amax(dim=-1).clamp(min=1e-8)
-    exp_v = torch.ceil(torch.log2(amax / 224.0)).clamp(min=-126, max=128) + 127.0
+    exp_v = torch.ceil(torch.log2(amax / 224.0)
+                       ).clamp(min=-126, max=128) + 127.0
     enc = exp_v.to(torch.uint8)
     sc_f32 = torch.pow(2.0, enc.float() - 127.0)
-    fp8 = (grp / sc_f32.unsqueeze(-1)).to(torch.float8_e4m3fn).view(total, NOPE_DIM)
+    fp8 = (grp / sc_f32.unsqueeze(-1)
+           ).to(torch.float8_e4m3fn).view(total, NOPE_DIM)
     fp8_bytes = fp8.view(torch.uint8)
     rope_bytes = rope_bf16.view(torch.uint8).view(total, ROPE_DIM * 2)
 
@@ -113,17 +95,17 @@ def _build_fp8_cache(num_blocks: int, block_size: int, device: str):
     enc_pb = enc.view(num_blocks, block_size, NOPE_DIM // 64)
     for pos in range(block_size):
         base = pos * NOPE_BYTES
-        flat[:, base : base + NOPE_DIM] = nope_pb[:, pos]
-        flat[:, base + NOPE_DIM : base + NOPE_BYTES] = rope_pb[:, pos]
+        flat[:, base: base + NOPE_DIM] = nope_pb[:, pos]
+        flat[:, base + NOPE_DIM: base + NOPE_BYTES] = rope_pb[:, pos]
     sb0 = block_size * NOPE_BYTES
     for pos in range(block_size):
         sb = sb0 + pos * SCALE_BYTES
-        flat[:, sb : sb + (NOPE_DIM // 64)] = enc_pb[:, pos]
+        flat[:, sb: sb + (NOPE_DIM // 64)] = enc_pb[:, pos]
     return cache
 
 
 # ---------------------------------------------------------------------------
-# Kernel launchers (autotuned: BLOCK_H / BLOCK_K / num_warps come from META)
+# Kernel launchers
 # ---------------------------------------------------------------------------
 def _launch_prefill(
     q,
@@ -291,7 +273,8 @@ def run_decode_bench(args, device: str):
         has_extra = bool(has_extra)
         torch.manual_seed(0)
         swa_cache = _build_fp8_cache(num_blocks, block_size, device)
-        q = torch.randn(num_q, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+        q = torch.randn(num_q, num_heads, HEAD_DIM,
+                        dtype=torch.bfloat16, device=device)
         swa_idx, swa_indptr, _ = _build_csr(
             num_q, num_blocks * block_size, topk, device
         )
@@ -306,7 +289,8 @@ def run_decode_bench(args, device: str):
         else:
             extra_cache = swa_cache
             extra_idx = torch.empty(0, dtype=torch.int32, device=device)
-            extra_indptr = torch.zeros(num_q + 1, dtype=torch.int32, device=device)
+            extra_indptr = torch.zeros(
+                num_q + 1, dtype=torch.int32, device=device)
             extra_nnz = 0
 
         attn_sink = torch.empty(1, device=device, dtype=torch.float32)
@@ -352,7 +336,8 @@ def _print_table(title, headers, rows):
             return f"{x:.3f}" if x >= 1 or x == 0 else f"{x:.4f}"
         return str(x)
     cells = [[_fmt(c) for c in r] for r in rows]
-    widths = [max(len(h), *(len(c[i]) for c in cells)) for i, h in enumerate(headers)]
+    widths = [max(len(h), *(len(c[i]) for c in cells))
+              for i, h in enumerate(headers)]
     line = " | ".join(h.rjust(widths[i]) for i, h in enumerate(headers))
     sep = "-+-".join("-" * w for w in widths)
     print(line)
@@ -393,8 +378,10 @@ def _parse_args():
         ],
     )
     args = p.parse_args()
-    args.prefill_cfgs = [tuple(int(x) for x in s.split(",")) for s in args.prefill_cfgs]
-    args.decode_cfgs = [tuple(int(x) for x in s.split(",")) for s in args.decode_cfgs]
+    args.prefill_cfgs = [tuple(int(x) for x in s.split(","))
+                         for s in args.prefill_cfgs]
+    args.decode_cfgs = [tuple(int(x) for x in s.split(","))
+                        for s in args.decode_cfgs]
     return args
 
 

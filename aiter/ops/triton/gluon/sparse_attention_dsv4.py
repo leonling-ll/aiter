@@ -1,52 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Gluon (CDNA4 / gfx950) port of the DeepSeek V4 sparse-MLA attention kernels.
-
-Hand-translated from the Triton kernels in
-``aiter/ops/triton/_triton_kernels/attention/sparse_attention_dsv4.py``.
-Layouts (MFMA / blocked / shared / dot-operand) are taken verbatim from the
-ttgir the Triton compiler produces for the gfx950 launch config
-(``BLOCK_H=16, BLOCK_K=16, BLOCK_D=512, num_warps=8, matrix_instr_nonkdim=16``):
-
-* QK dot  -> ``#mma``  = amd_mfma v4, warpsPerCTA=[8,1], instrShape=[16,16,32],
-             transposed, dot-operand kWidth=8.
-* PV dot  -> ``#mma1`` = amd_mfma v4, warpsPerCTA=[1,8], instrShape=[16,16,16],
-             transposed, dot-operand kWidth=4.
-
-Both kernels reduce over the sparse KV axis with one online-softmax statistic.
-The scores live in the QK layout (``#mma``); the value accumulator lives in the
-PV layout (``#mma1``); the per-row softmax rescale factor ``alpha`` is converted
-between the two slice layouts each iteration (mirroring the ttgir).
-"""
-
 import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-# Every layout derives its warpsPerCTA from gl.num_warps(), so num_warps is a
-# safely autotunable parameter.
-_WARP_SIZE = gl.constexpr(64)
-
-# This module is imported only on gfx950 (see the arch guard in the wrapper),
-# whose per-CU LDS is 160 KiB.
 _LDS_LIMIT = 163840
 
 
-# ---------------------------------------------------------------------------
-# Autotune config space (mirrors the Triton kernels' search, minus num_stages —
-# the Gluon kernels carry an explicit software pipeline — and minus
-# matrix_instr_nonkdim, which is fixed by the explicit AMDMFMALayout).
-# ---------------------------------------------------------------------------
-
-
 def _prefill_prune_configs(configs, named_args, **kwargs):
-    """Drop prefill configs whose padded KV LDS tile exceeds per-CU LDS.
-
-    The kernel's only shared allocation is one [BLOCK_K, BLOCK_D] bf16 tile with
-    16-element row padding (the compiler-matching PaddedSharedLayout).
-    """
     BLOCK_D = kwargs.get("BLOCK_D", named_args.get("BLOCK_D"))
     pruned = [
         c for c in configs if (BLOCK_D + 16) * c.kwargs["BLOCK_K"] * 2 <= _LDS_LIMIT
@@ -55,33 +18,26 @@ def _prefill_prune_configs(configs, named_args, **kwargs):
 
 
 def _get_prefill_autotune_configs():
-    configs = []
-    for BLOCK_H in [16, 32, 64]:
-        for BLOCK_K in [16, 32, 64, 128]:
-            for WPE in [0, 2]:
-                for nw in [4, 8]:
-                    # (BLOCK_K=64, num_warps=8, BLOCK_H<64) miscompiles the
-                    # MFMA/blocked layout on gfx950 (verified numerically wrong),
-                    # so it is excluded from the search space.
-                    if BLOCK_K == 64 and nw == 8 and BLOCK_H < 64:
-                        continue
-                    configs.append(
-                        triton.Config(
-                            {"BLOCK_H": BLOCK_H, "BLOCK_K": BLOCK_K, "waves_per_eu": WPE},
-                            num_warps=nw,
-                            num_stages=1,  # Gluon kernel owns its pipeline.
-                        )
-                    )
+    # configs =  [
+    #     triton.Config(
+    #         {
+    #             "BLOCK_H": BLOCK_H,
+    #             "BLOCK_K": BLOCK_K,
+    #             "waves_per_eu": WPE,
+    #         },
+    #         num_warps=nw,
+    #     )
+    #     for BLOCK_H in [16, 32, 64]
+    #     for BLOCK_K in [16, 32]
+    #     for WPE in [0, 1, 2]
+    #     for nw in [4, 8]
+    # ]
+    configs = [triton.Config({"BLOCK_H": 64, "BLOCK_K": 16, "waves_per_eu":0}, num_warps=4)]
+
     return configs
 
 
 def _decode_prune_configs(configs, named_args, **kwargs):
-    """Drop decode configs whose KV LDS tiles exceed per-CU LDS.
-
-    Per tile the kernel stages four bf16 buffers (NoPE + RoPE, each in the direct
-    [BLOCK_K, dim] and transposed [dim, BLOCK_K] orientation):
-    ``2 * (NOPE_BLOCK + ROPE_DIM) * BLOCK_K`` elements.
-    """
     NOPE_BLOCK = kwargs.get("NOPE_BLOCK", named_args.get("NOPE_BLOCK"))
     ROPE_DIM = kwargs.get("ROPE_DIM", named_args.get("ROPE_DIM"))
     pruned = [
@@ -97,11 +53,10 @@ def _get_decode_autotune_configs():
         triton.Config(
             {"BLOCK_H": BLOCK_H, "BLOCK_K": BLOCK_K, "waves_per_eu": WPE},
             num_warps=nw,
-            num_stages=1,  # Gluon kernel owns its pipeline.
         )
         for BLOCK_H in [16, 32, 64]
-        for BLOCK_K in [16, 32, 64, 128]
-        for WPE in [0, 1, 2]
+        for BLOCK_K in [16, 32]
+        for WPE in [0, 2]
         for nw in [4, 8]
     ]
 
@@ -161,15 +116,9 @@ def _sparse_attn_prefill_kernel(
 
     # [BLOCK_K, BLOCK_D] load layout (also used for q [BLOCK_H, BLOCK_D]).
     blk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8], threads_per_warp=[1, _WARP_SIZE],
+        size_per_thread=[1, 8], threads_per_warp=[1, 64],
         warps_per_cta=[nw, 1], order=[1, 0],
     )
-    # One LDS buffer holds the KV tile [BLOCK_K, BLOCK_D] (dim contiguous). It is
-    # consumed twice: as the QK B-operand transposed to [BLOCK_D, BLOCK_K] (via a
-    # permute *view*, no data movement) and as the PV B-operand directly. The
-    # compiler-matching padded layout (gfx950 + async_copy + bf16 + mfmaNonKDim=16
-    # + inner dim == paddingInterval 512) is bank-conflict-free for both reads, so
-    # a single buffer suffices instead of one per orientation.
     sh_kv: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[512, 16]], [BLOCK_K, BLOCK_D], [1, 0]
     )
@@ -221,11 +170,6 @@ def _sparse_attn_prefill_kernel(
         valid_blk = (kpos < kv_len) & (slot >= 0) & (slot < num_kv)
         safe_slot = gl.where(valid_blk, slot, 0)
 
-        # DMA the gathered KV tile [BLOCK_K, BLOCK_D] global->LDS directly (no
-        # register staging). safe_slot is clamped in-bounds so every offset is a
-        # valid read; the softmax score mask below zeroes out-of-range kpos, so no
-        # load mask is needed (an unmasked DMA also sidesteps the CDNA4
-        # broadcast-mask lowering restriction).
         kv_off = safe_slot[:, None] * kv_stride_n + dim_off[None, :] * kv_stride_d
         gl.amd.cdna4.async_copy.buffer_load_to_shared(smem_kv, kv_ptr, kv_off)
         gl.amd.cdna4.async_copy.commit_group()
@@ -273,9 +217,6 @@ def _sparse_attn_prefill_kernel(
         scale_row = 1.0 / denom
         guard = l_i > 0.0
 
-    # Select on the OUTPUT (mirrors Triton's tl.where(l>0, acc/denom, 0)): a per-lane
-    # select yields clean 0 for empty / all-invalid rows even when acc is NaN (a
-    # leading fully-invalid kv tile makes alpha=exp(-inf-(-inf))=NaN -> acc=NaN).
     scale_pv = gl.convert_layout(scale_row, sl_h_pv)
     guard_pv = gl.convert_layout(guard, sl_h_pv)
     out = gl.where(guard_pv[:, None], acc * scale_pv[:, None], 0.0)
@@ -323,7 +264,6 @@ def _decode_core_attn(
     BLOCK_K: gl.constexpr,
     IS_FNUZ: gl.constexpr,
 ):
-    """One ragged sparse pass; folds tiles into the shared softmax state."""
     nw: gl.constexpr = gl.num_warps()
     mma_qk: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16, 32], transposed=True,
@@ -599,8 +539,6 @@ def _sparse_attn_decode_kernel(
         scale_row = 1.0 / denom
         guard = l_i > 0.0
 
-    # Select on the OUTPUT (mirrors Triton): clean 0 for empty / all-invalid rows
-    # even when acc is NaN (leading fully-invalid kv tile -> alpha NaN -> acc NaN).
     scale_pv = gl.convert_layout(scale_row, sl_h_pv)
     guard_pv = gl.convert_layout(guard, sl_h_pv)
     out_nope = gl.where(guard_pv[:, None], acc_nope * scale_pv[:, None], 0.0)
