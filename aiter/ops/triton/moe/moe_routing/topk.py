@@ -211,6 +211,7 @@ def topk(
     assert return_bitmatrix
     assert score_mode in (
         "softmax",
+        "sigmoid",
         "sqrtsoftplus",
         "sigmoid",
     ), f"score_mode must be 'softmax', 'sqrtsoftplus' or 'sigmoid', got {score_mode!r}"
