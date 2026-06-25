@@ -146,6 +146,55 @@ tuned_df = pd.DataFrame(
     ]
 )
 
+unsupported_path = os.environ.get(
+    "AITER_GEMM_UNSUPPORTED_CSV",
+    f"{this_dir}/configs/bf16_unsupported_gemm_gfx1250.csv",
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _load_unsupported_gemm_shapes() -> frozenset:
+    """Load the Triton-only shape set from the unsupported-GEMM CSV."""
+    if not os.path.exists(unsupported_path):
+        return frozenset()
+    try:
+        df = pd.read_csv(unsupported_path).drop_duplicates()
+    except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
+        logger.warning(f"could not read unsupported-GEMM CSV {unsupported_path}: {e}")
+        return frozenset()
+    shapes = set()
+    for r in df.itertuples(index=False):
+        shapes.add(
+            (
+                int(r.M),
+                int(r.N),
+                int(r.K),
+                bool(r.bias),
+                str(r.dtype),
+                str(r.outdtype),
+                bool(r.scaleAB),
+                bool(r.bpreshuffle),
+            )
+        )
+    return frozenset(shapes)
+
+
+def is_unsupported_skinny_gfx1250(
+    M, N, K, bias, dtype, otype, scaleAB, bpreshuffle
+) -> bool:
+    """True if this bf16 GEMM shape is recorded as native-unsupported (-> Torch)."""
+    key = (
+        int(M),
+        int(N),
+        int(K),
+        bool(bias),
+        str(dtype),
+        str(otype),
+        bool(scaleAB),
+        bool(bpreshuffle),
+    )
+    return get_gfx()=="gfx1250" and key in _load_unsupported_gemm_shapes()
+
 
 @functools.lru_cache(maxsize=1)
 def get_GEMM_A16W16_config_():
@@ -275,33 +324,18 @@ def get_GEMM_A16W16_config(
                     False
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
         elif is_skinny_default_shape(M, N, K, dtype, cu_num):
-            # The "skinny" custom HIP kernels (wvSpltK / LLMM1 /
-            # wv_splitk_small_fp16_bf16) are compiled only under
-            # __HIP__MI350_MI300_MI250__ (gfx90a / gfx942 / gfx950). On any other
-            # arch (e.g. gfx1250 / MI455) they are assert(false) stubs that
-            # device-trap (HSA_STATUS_ERROR_EXCEPTION). Route those archs to the
-            # Triton a16w16 GEMM instead of the stub.
-            if gfx in ("gfx90a", "gfx942", "gfx950"):
-                # soltype, solution_idx = 3, 2
-                default_config["libtype"] = "skinny"
-                default_config["solidx"] = 2
-            else:
-                default_config["libtype"] = "triton"
-                default_config["solidx"] = 0
-            default_config["kernelName"] = ""
-        if not default_config:
-            # gfx1250 (MI455): the torch default (F.linear -> hipBLASLt) throws
-            # std::bad_variant_access on awkward bf16 shapes (e.g. skinny-N like
-            # N=128, K=6144). Route every untuned bf16 GEMM to the Triton
-            # gemm_a16w16 (gluon on gfx1250), which handles partial-N tiles, so
-            # both the skinny (small-M) and large-M small-N cases use one path.
-            if gfx == "gfx1250":
-                default_config["libtype"] = "triton"
-                default_config["solidx"] = 0
-                default_config["kernelName"] = ""
-            else:
+            # soltype, solution_idx = 3, 2
+            if is_unsupported_skinny_gfx1250(M, N, K, bias, dtype, otype, scaleAB, bpreshuffle):
                 default_config["libtype"] = "torch"
                 default_config["solidx"] = 0
+                logger.info(f"unsupported skinny shape: M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, using {default_config['libtype']} solution:{default_config['solidx']}")
+            else:
+                default_config["libtype"] = "skinny"
+                default_config["solidx"] = 2
+            default_config["kernelName"] = ""
+        if not default_config:
+            default_config["libtype"] = "torch"
+            default_config["solidx"] = 0
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
         )
