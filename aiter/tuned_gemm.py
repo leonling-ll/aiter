@@ -275,9 +275,19 @@ def get_GEMM_A16W16_config(
                     False
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
         elif is_skinny_default_shape(M, N, K, dtype, cu_num):
-            # soltype, solution_idx = 3, 2
-            default_config["libtype"] = "skinny"
-            default_config["solidx"] = 2
+            # The "skinny" custom HIP kernels (wvSpltK / LLMM1 /
+            # wv_splitk_small_fp16_bf16) are compiled only under
+            # __HIP__MI350_MI300_MI250__ (gfx90a / gfx942 / gfx950). On any other
+            # arch (e.g. gfx1250 / MI455) they are assert(false) stubs that
+            # device-trap (HSA_STATUS_ERROR_EXCEPTION). Route those archs to the
+            # Triton a16w16 GEMM instead of the stub.
+            if gfx in ("gfx90a", "gfx942", "gfx950"):
+                # soltype, solution_idx = 3, 2
+                default_config["libtype"] = "skinny"
+                default_config["solidx"] = 2
+            else:
+                default_config["libtype"] = "triton"
+                default_config["solidx"] = 0
             default_config["kernelName"] = ""
         if not default_config:
             default_config["libtype"] = "torch"
