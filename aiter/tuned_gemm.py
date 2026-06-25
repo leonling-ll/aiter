@@ -290,8 +290,18 @@ def get_GEMM_A16W16_config(
                 default_config["solidx"] = 0
             default_config["kernelName"] = ""
         if not default_config:
-            default_config["libtype"] = "torch"
-            default_config["solidx"] = 0
+            # gfx1250 (MI455): the torch default (F.linear -> hipBLASLt) throws
+            # std::bad_variant_access on awkward bf16 shapes (e.g. skinny-N like
+            # N=128, K=6144). Route every untuned bf16 GEMM to the Triton
+            # gemm_a16w16 (gluon on gfx1250), which handles partial-N tiles, so
+            # both the skinny (small-M) and large-M small-N cases use one path.
+            if gfx == "gfx1250":
+                default_config["libtype"] = "triton"
+                default_config["solidx"] = 0
+                default_config["kernelName"] = ""
+            else:
+                default_config["libtype"] = "torch"
+                default_config["solidx"] = 0
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
         )
