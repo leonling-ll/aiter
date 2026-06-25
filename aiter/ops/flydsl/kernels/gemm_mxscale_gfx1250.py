@@ -236,7 +236,8 @@ def compile_mxscale_gemm(
     else:
         _persistent_workers = 0
 
-    use_cluster = cluster_m > 1 or cluster_n > 1
+    # use_cluster = cluster_m > 1 or cluster_n > 1
+    use_cluster = False
     if use_cluster:
         if cluster_m * cluster_n > 16:
             raise ValueError(

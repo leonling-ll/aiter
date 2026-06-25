@@ -190,7 +190,8 @@ def compile_fp8fp4_gemm(
     if split_k < 1:
         raise ValueError(f"split_k must be >= 1, got {split_k}")
 
-    use_cluster = cluster_m > 1 or cluster_n > 1
+    # use_cluster = cluster_m > 1 or cluster_n > 1
+    use_cluster = False
     if use_cluster:
         if cluster_m * cluster_n > 16:
             raise ValueError(
