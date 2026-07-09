@@ -114,6 +114,22 @@ def get_kernel_config(m, n, k, routing_data):
     return ret
 
 
+# Restored: removed by #3823 (4529d7aa6 "Unify the scale and weight shuffling
+# into shuffle.py"); re-added here because atom.model_ops.fused_moe_triton imports
+# `swizzle_scales` from this module (matches revert #3891).
+def swizzle_scales(data):
+    NON_K_PRESHUFFLE_BLOCK_SIZE = 32
+    block_shape = data.shape
+    SCALE_K = block_shape[-2]
+    N = block_shape[-1]
+    data = data.transpose(-1, -2)
+    data = data.view(-1, N // NON_K_PRESHUFFLE_BLOCK_SIZE, 2, 16, SCALE_K // 8, 2, 4, 1)
+    data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
+    E = block_shape[0]
+    data = data.reshape(E, N // 32, SCALE_K * 32)
+    return data.transpose(-1, -2)
+
+
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
