@@ -11,33 +11,6 @@ The kernel tuned is the real production one
 **gluon** backend on `gfx1250` (MI400 / MI455) and the **triton** backend
 elsewhere. The baseline / correctness oracle is torch `F.linear`.
 
-## Quick start
-
-Run everything from the repo root (`cd /home/leling/aiter`). Backend/arch are
-auto-detected (gluon on gfx1250, triton elsewhere).
-
-```bash
-# 0. shapes CSV to work on (default here uses aiter/configs/bf16_untuned_gemm.csv)
-CSV=aiter/configs/bf16_untuned_gemm.csv
-
-# 1. baseline BEFORE tuning: torch vs kernel with arch-default configs only
-python -m op_tests.tuning_tests.gemm_a16w16.compare_torch_vs_triton --csv $CSV --force-default -o before.csv
-
-# 2. tune the shapes -> writes {arch}-GEMM-A16W16-N=*-K=*.json into configs/gemm/
-python -m op_tests.tuning_tests.gemm_a16w16.tune --csv $CSV
-
-# 3. check every shape resolves to the bucket it was tuned under
-python -m op_tests.tuning_tests.gemm_a16w16.verify_buckets --csv $CSV
-
-# 4. validate the emitted configs compile/run and match torch
-python -m pytest op_tests/tuning_tests/gemm_a16w16/test_gemm_a16w16_tuned.py -q
-
-# 5. perf AFTER tuning (tuned json where present) — diff against before.csv
-python -m op_tests.tuning_tests.gemm_a16w16.compare_torch_vs_triton --csv $CSV -o after.csv
-```
-
-Each step is described in detail in its section below.
-
 ## Files
 
 | file | purpose |
@@ -47,8 +20,6 @@ Each step is described in detail in its section below.
 | `buckets.py` | M → `M_LEQ_/M_GEQ_/any` bucket mapping (mirrors the runtime lookup) |
 | `tune.py` | the tuner CLI (parse CSV → bucket → gate → bench → emit JSON) |
 | `test_gemm_a16w16_tuned.py` | UT: production dispatch + every stored bucket config is correct |
-| `compare_torch_vs_triton.py` | torch vs triton/gluon perf comparison over a shapes CSV (tuned-if-present-else-default) |
-| `verify_buckets.py` | verify each CSV shape resolves to the bucket the tuner keys it under |
 
 ## Tune on MI455 (gfx1250, gluon)
 
@@ -103,69 +74,6 @@ python op_tests/tuning_tests/gemm_a16w16/test_gemm_a16w16_tuned.py --smoke
 `test_production_dispatch` checks `config=None` (real dispatch) is numerically
 correct for the CSV shapes; `test_tuned_configs` forces every stored bucket
 config and asserts it compiles, runs, and matches the baseline.
-
-## Compare torch vs triton/gluon
-
-Benchmark the kernel against the torch `F.linear` baseline over a shapes CSV:
-
-```bash
-python -m op_tests.tuning_tests.gemm_a16w16.compare_torch_vs_triton
-python -m op_tests.tuning_tests.gemm_a16w16.compare_torch_vs_triton \
-    --csv aiter/configs/bf16_untuned_gemm.csv --backend auto -o results.csv
-```
-
-Every `(M, N, K)` row runs the kernel with `config=None` — i.e. exactly the
-production config policy: the specialized `{arch}-GEMM-A16W16-N={N}-K={K}.json`
-is used when it exists, otherwise the arch default `{arch}-GEMM-A16W16.json`.
-Each shape is labeled **`tuned`** or **`default`** in the `src` column so you can
-see which shapes actually pick up your tuned files.
-
-Per shape it prints torch vs triton latency, TFLOPs, `speedup = torch_ms /
-triton_ms`, and a correctness check (torch vs kernel); then a summary (geomean
-speedup, win count, tuned/default counts, mismatches). `-o` dumps the per-shape
-table to CSV.
-
-Flags: `--backend {auto,gluon,triton}`, `--csv PATH`, `--warmup/--rep`,
-`--atol/--rtol`, `--no-check`, `-o/--out`, `--force-default`.
-
-**`--force-default`** forces the arch default config for the kernel, ignoring any
-tuned `N=K` json. This is the easy A/B for "how much did tuning buy me":
-
-```bash
-# without tuned configs (arch default only)
-python -m op_tests.tuning_tests.gemm_a16w16.compare_torch_vs_triton --force-default -o before.csv
-# with tuned configs (specialized json where present)
-python -m op_tests.tuning_tests.gemm_a16w16.compare_torch_vs_triton              -o after.csv
-```
-
-Rows run under `--force-default` are labeled `default*` in the `src` column.
-(Equivalently, a plain run shows `tuned`/`default` per shape depending on whether
-a specialized json exists, so a single default-policy run already tells you which
-shapes are picking up tuned configs.)
-
-Note the default CSV here (`aiter/configs/bf16_untuned_gemm.csv`) has a different
-N,K set than the ATOM CSV `tune.py` defaults to, so tune against the same CSV you
-compare on for the rows to line up.
-
-## Verify shape → bucket → json mapping
-
-Confirm every `(M, N, K)` in a CSV resolves, through the real `get_gemm_config`,
-to the bucket key the tuner stores it under:
-
-```bash
-# against currently-installed configs (use on MI455 after tuning)
-python -m op_tests.tuning_tests.gemm_a16w16.verify_buckets
-
-# arch-independent proof: synthesize tuner-layout json in a temp dir and assert
-# each M lands in its own bucket (no tuned files required)
-python -m op_tests.tuning_tests.gemm_a16w16.verify_buckets --synthetic
-```
-
-`--synthetic` writes specialized files whose buckets are exactly what the tuner
-emits for the CSV, points the config loader at them, and checks that each M is
-resolved to its bucket (`M_LEQ_x` / `M_GEQ_8192`) with `is_tuned=True`. The
-`--live` (default) mode reports, per shape, whether a specialized file exists,
-whether the lookup treats it as tuned, and which bucket was selected.
 
 ## Notes on developing off-target (e.g. MI350 / gfx950)
 
