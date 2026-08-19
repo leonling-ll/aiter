@@ -73,7 +73,7 @@ def unswizzle_mx_scale_gfx1250(
 
 
 @triton.jit(launch_metadata=matmul_launch_metadata)
-def _moe_gemm_a16w4_triton(
+def _moe_gemm_a16w4(
     Y,
     stride_y_k,
     stride_y_m,

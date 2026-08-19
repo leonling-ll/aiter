@@ -131,6 +131,39 @@ def get_kernel_config_triton(m, n, k, routing_data):
     return ret
 
 
+def get_kernel_config_gluon(m, n, k, routing_data):
+    block_m = routing_data.block_m
+    group_m = 4
+    xcd_swizzle = 1
+    w_cache_modifier = ".cg" if block_m <= 32 else None
+    num_stages = 2
+    split_k = 1
+
+    block_n = 128
+    num_warps = 4
+
+    if block_m == 16 or block_m == 32:
+        block_k = 512
+    else:
+        block_k = 256
+
+    ret = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "group_m": group_m,
+        "xcd_swizzle": xcd_swizzle,
+        "w_cache_modifier": w_cache_modifier,
+        "split_k": split_k,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
+    return ret
+
+
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
@@ -188,6 +221,14 @@ def moe_gemm_a16w4(
     Returns:
         torch.Tensor: Output with shape as x(num_tokens, K/hidden_dim/emb_dim)
     """
+
+    # AITER_MOE_A16W4_BACKEND={triton,gluon} forces a backend, overriding both
+    # the caller's argument and auto-detection. Escape hatch for Triton builds
+    # whose fp4 scaled_upcast expects per-element scales, which the gluon kernel
+    # does not produce (it passes the compact one-per-32-element MX scale).
+    _backend_env = os.environ.get("AITER_MOE_A16W4_BACKEND")
+    if _backend_env:
+        backend = _backend_env.strip().lower()
 
     if backend in (None, "gluon"):
         if _is_gluon_available():
