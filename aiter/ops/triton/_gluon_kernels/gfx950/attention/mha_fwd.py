@@ -5,12 +5,17 @@ import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd import cdna4 as cdna4_ops
 from triton.experimental.gluon.language.amd import warp_pipeline_stage
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as async_cp
 from triton.experimental.gluon.language.amd.cdna4 import mfma as mfma_cdna4
+from triton.experimental.gluon.language.amd.cdna4 import (
+    mfma_scaled as mfma_scaled_cdna4,
+)
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 _LOGGER = AiterTritonLogger()
 
@@ -21,15 +26,66 @@ _LN2 = gl.constexpr(0.6931471824645996)
 # Layout helpers (constexpr -- evaluated at compile time)
 # ---------------------------------------------------------------------------
 
-# Padding interval, in elements, of the K/V shared layouts.  512 elements = 1 KB of
-# bf16/fp16, which is the granularity the AMD Triton compiler itself pads at.
-_PAD_INTERVAL = 512
-
 
 @gluon.constexpr_function
 def _bits(n):
     """log2 of a power of two."""
     return n.bit_length() - 1
+
+
+@gluon.constexpr_function
+def elem_bits_of(dtype):
+    """Storage width of one element, in bits."""
+    return dtype.primitive_bitwidth
+
+
+@gluon.constexpr_function
+def pad_interval(elem_bits):
+    """Padding interval in elements: one 128-bit lane vector per lane of a warp.
+
+    Also a lowering requirement, not just a bank-conflict choice -- the
+    direct-to-LDS copy caps its vector at interval/warp_size, and CDNA4 only
+    supports 128- and 32-bit direct-to-LDS, so a smaller interval makes
+    buffer_load_to_shared unlowerable at 8-bit.
+    """
+    return 8192 // elem_bits
+
+
+@gluon.constexpr_function
+def dma_elems(elem_bits):
+    """Elements per lane in one 128-bit global->LDS copy."""
+    return 128 // elem_bits
+
+
+@gluon.constexpr_function
+def bases_to_source_layout(offset_bases, contiguity, num_warps, shape, warp_size=64):
+    """DMA source layout matching a padded shared layout, bases partitioned the way
+    CoalesceAsyncCopy does it: log2(contiguity) to registers, then a warp's worth to
+    lanes, then log2(num_warps) to warps, then whatever is left back to registers.
+
+    Used with `compute_efficient_padded_shared_layout`, whose bases the hand-rolled
+    `dma_source_layout` below does not reproduce at 8-bit.
+    """
+    rank = len(shape)
+    lg2_c = _bits(contiguity)
+    lg2_ws = _bits(warp_size)
+    lg2_nw = _bits(num_warps)
+    i = 0
+    reg = list(offset_bases[i : i + lg2_c])
+    i += lg2_c
+    lane = list(offset_bases[i : i + lg2_ws])
+    i += lg2_ws
+    warp = list(offset_bases[i : i + lg2_nw])
+    i += lg2_nw
+    warp = warp + [[0] * rank] * (lg2_nw - len(warp))
+    reg = reg + list(offset_bases[i:])
+    return gl.DistributedLinearLayout(
+        reg_bases=reg,
+        lane_bases=lane,
+        warp_bases=warp,
+        block_bases=[],
+        shape=list(shape),
+    )
 
 
 @gluon.constexpr_function
@@ -125,7 +181,7 @@ def dma_source_layout(rows, cols, contig_dim, num_warps, vec, warp_size=64):
 
 
 @gluon.constexpr_function
-def dma_shared_layout(rows, cols, contig_dim, pad, interval=_PAD_INTERVAL):
+def dma_shared_layout(rows, cols, contig_dim, pad, interval):
     """Row-staggered padded shared layout for a K^T or V tile.
 
     Both tiles are written by the DMA along their contiguous axis but read back by
@@ -158,7 +214,7 @@ def dma_layouts_ok(head_dim, block_n, num_warps, elem_bits):
     if dma_vec(block_n, head_dim, 1, num_warps, elem_bits) == 0:
         return False
     # The padded layout needs the strided axis to split evenly across padding intervals.
-    return block_n % max(_PAD_INTERVAL // head_dim, 1) == 0
+    return block_n % max(pad_interval(elem_bits) // head_dim, 1) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +234,7 @@ def _row_max(x):
 
 
 @gluon.jit
-def _softmax_vec1(qk, m_run, QK_SCALE: gl.constexpr, SCALE_ON_Q: gl.constexpr):
+def _softmax_vec1(qk, m_run, qk_scale, SCALE_ON_Q: gl.constexpr):
     """VEC1 -- softmax numerator: new row max, the ``exp2`` burst, and ``alpha``.
 
     Lives in the ``dot2`` cluster: ``exp2`` is the most expensive item in the softmax
@@ -192,11 +248,11 @@ def _softmax_vec1(qk, m_run, QK_SCALE: gl.constexpr, SCALE_ON_Q: gl.constexpr):
         m_new = gl.maximum(m_run, m_ij, propagate_nan=tl.PropagateNan.ALL)
         p = gl.exp2(qk - m_new[:, None])
     else:
-        m_ij = _row_max(qk) * QK_SCALE
+        m_ij = _row_max(qk) * qk_scale
         m_new = gl.maximum(m_run, m_ij, propagate_nan=tl.PropagateNan.ALL)
         # Fuse the multiply and the subtract at the source (one llvm.fmuladd) rather
         # than leaving an fmul/fsub pair for the backend to contract later.
-        p = gl.exp2(gl.fma(qk, QK_SCALE, -m_new[:, None]))
+        p = gl.exp2(gl.fma(qk, qk_scale, -m_new[:, None]))
     alpha = gl.exp2(m_run - m_new)
     return m_new, p, alpha
 
@@ -222,6 +278,17 @@ def _softmax_vec2(acc, l_i, p, alpha, P_LAYOUT: gl.constexpr, DTYPE: gl.constexp
 # ---------------------------------------------------------------------------
 # Pipeline building blocks
 # ---------------------------------------------------------------------------
+
+
+@gluon.jit
+def _mma(a, b, acc, IS_FP8: gl.constexpr):
+    """One MFMA. fp8 needs the scaled instruction: it is the only CDNA4 encoding
+    that reaches the 32x32x64 shape, and the plain fp8 MFMA is the same 32x32x16
+    rate as bf16. Null scales lower to a constant exponent of 1."""
+    if IS_FP8:
+        return mfma_scaled_cdna4(a, None, "e4m3", b, None, "e4m3", acc)
+    else:
+        return mfma_cdna4(a, b, acc)
 
 
 @gluon.jit
@@ -361,10 +428,11 @@ def _pipe_tile(
     KT_DOT: gl.constexpr,
     V_DOT: gl.constexpr,
     P_DOT: gl.constexpr,
-    QK_SCALE: gl.constexpr,
+    qk_scale,
     SCALE_ON_Q: gl.constexpr,
     DTYPE: gl.constexpr,
     HAS_MASK: gl.constexpr,
+    IS_FP8: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
@@ -382,7 +450,7 @@ def _pipe_tile(
     """
     with warp_pipeline_stage("dot1"):
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
-        qk = mfma_cdna4(q_dot, kt_dot, qk)
+        qk = _mma(q_dot, kt_dot, qk, IS_FP8)
         acc, l_i, p_dot = _softmax_vec2(acc, l_i, p_c, alpha_c, P_DOT, DTYPE)
 
     # wait_group(2) is the depth the pipeline needs, but the backend then derives a
@@ -394,8 +462,8 @@ def _pipe_tile(
         _dma(kt_smem.index(NXT), k_base + (blk + 3) * kt_step, kt_off, k_mask, HAS_MASK)
 
     with warp_pipeline_stage("dot2"):
-        acc = mfma_cdna4(p_dot, v_dot, acc)
-        m_run, p_c, alpha_c = _softmax_vec1(qk, m_run, QK_SCALE, SCALE_ON_Q)
+        acc = _mma(p_dot, v_dot, acc, IS_FP8)
+        m_run, p_c, alpha_c = _softmax_vec1(qk, m_run, qk_scale, SCALE_ON_Q)
 
     async_cp.wait_group(1)
     with warp_pipeline_stage("mem2"):
@@ -406,12 +474,33 @@ def _pipe_tile(
 
 
 # ---------------------------------------------------------------------------
-# Kernel
+# Shared kernel body
 # ---------------------------------------------------------------------------
+# The whole rotated four-cluster pipeline lives here, once.  The two kernel
+# entry points below differ only in what they must fetch before the loop can
+# start -- bf16 nothing, fp8 three descale scalars -- so they own their own
+# signatures and hand the results down as ordinary values.
 
 
 @gluon.jit
-def _mha_fwd_gluon_kernel(
+def _program_ids(HQ: gl.constexpr, HK: gl.constexpr):
+    """(start_m, off_h_q, off_h_k, off_z) for this workgroup.
+
+    Shared by both kernel entries: the fp8 one needs ``off_h_k`` before the body
+    runs, to index the descales, so the derivation cannot live in the body alone.
+    """
+    start_m = gl.program_id(0)
+    off_h_q = gl.program_id(1)
+    off_z = gl.program_id(2)
+    gl.assume(start_m >= 0)
+    gl.assume(off_h_q >= 0)
+    gl.assume(off_z >= 0)
+    GROUP_SIZE: gl.constexpr = HQ // HK
+    return start_m, off_h_q, off_h_q // GROUP_SIZE, off_z
+
+
+@gluon.jit
+def _mha_fwd_body(
     Q,
     K,
     V,
@@ -433,9 +522,13 @@ def _mha_fwd_gluon_kernel(
     stride_oh,
     stride_om,
     stride_on,
-    SM_SCALE: gl.constexpr,
+    start_m,
+    off_h_q,
+    off_h_k,
+    off_z,
+    qk_scale,
+    v_descale,
     HQ: gl.constexpr,
-    HK: gl.constexpr,
     SEQLEN_Q: gl.constexpr,
     SEQLEN_K: gl.constexpr,
     ACTUAL_HEAD_DIM: gl.constexpr,
@@ -450,36 +543,62 @@ def _mha_fwd_gluon_kernel(
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
+    """FlashAttention-2 forward for one [BLOCK_M, HEAD_DIM] output tile.
+
+    ``qk_scale`` already carries ``log2(e)`` and, at fp8, the Q and K descales;
+    ``v_descale`` is loop-invariant and folds into the epilogue.  Both are runtime
+    values that constant-fold at bf16, where the caller passes literals.
+    """
     # ---------------- layouts ----------------
+    ELEM_BITS: gl.constexpr = elem_bits_of(DTYPE)
+    IS_FP8: gl.constexpr = ELEM_BITS == 8
+
+    # Not a ratio of the element width: fp8's 32x32x64 is a different, double-rate
+    # instruction reachable only through the scaled MFMA, not merely a wider K. The
+    # plain fp8 MFMA is 32x32x16, the same rate as bf16.
+    MFMA_K: gl.constexpr = 64 if IS_FP8 else 16
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[32, 32, 16],
+        instr_shape=[32, 32, MFMA_K],
         transposed=True,
         warps_per_cta=[NUM_WARPS, 1],
     )
+    # QK reads its operands 128 bits at a time. PV reads V through the
+    # hardware-transposing 64-bit LDS read, hence half the width -- except at fp8,
+    # where the scaled MFMA requires both operands to share one k_width.
+    QK_KW: gl.constexpr = 128 // ELEM_BITS
+    PV_KW: gl.constexpr = 128 // ELEM_BITS if IS_FP8 else 64 // ELEM_BITS
     q_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfma, k_width=8
+        operand_index=0, parent=mfma, k_width=QK_KW
     )
     kt_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfma, k_width=8
+        operand_index=1, parent=mfma, k_width=QK_KW
     )
     p_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfma, k_width=4
+        operand_index=0, parent=mfma, k_width=PV_KW
     )
     v_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfma, k_width=4
+        operand_index=1, parent=mfma, k_width=PV_KW
     )
 
     m_slice: gl.constexpr = gl.SliceLayout(1, mfma)  # per-row vectors (m_i, l_i)
     n_slice: gl.constexpr = gl.SliceLayout(0, mfma)  # per-column vectors
 
-    # Q staging and the O store share one blocked layout: `order=[1, 0]` puts the head
-    # dim contiguous and 8 elements per lane is exactly the dwordx4 both the DMA and
-    # the store want.
-    q_blocked: gl.constexpr = blocked_row_major([BLOCK_M, HEAD_DIM], 8, NUM_WARPS)
-    q_shared: gl.constexpr = swizzled([1, 0])
+    # `order=[1, 0]` puts the head dim contiguous. Q and O need different vector
+    # widths when their element widths differ (fp8 in, fp32 out), so they get
+    # separate layouts; at 16-bit both resolve to the same one.
+    O_BITS: gl.constexpr = elem_bits_of(Out.dtype.element_ty)
+    q_blocked: gl.constexpr = blocked_row_major(
+        [BLOCK_M, HEAD_DIM], dma_elems(ELEM_BITS), NUM_WARPS
+    )
+    o_blocked: gl.constexpr = blocked_row_major(
+        [BLOCK_M, HEAD_DIM], dma_elems(O_BITS), NUM_WARPS
+    )
+    q_shared: gl.constexpr = swizzled([1, 0], vec=dma_elems(ELEM_BITS))
     offs_m_blocked: gl.constexpr = gl.SliceLayout(1, q_blocked)
     offs_d_blocked: gl.constexpr = gl.SliceLayout(0, q_blocked)
+    offs_m_o_blk: gl.constexpr = gl.SliceLayout(1, o_blocked)
+    offs_d_o_blk: gl.constexpr = gl.SliceLayout(0, o_blocked)
 
     # The LSE store is 1-D over BLOCK_M and wants consecutive rows on consecutive lanes,
     # so it needs its own M-major arrangement rather than a slice of `q_blocked`, which
@@ -489,29 +608,40 @@ def _mha_fwd_gluon_kernel(
     )
     offs_m_lse: gl.constexpr = gl.SliceLayout(1, lse_blocked)
 
-    ELEM_BITS: gl.constexpr = 16
     KV_VEC: gl.constexpr = dma_vec(HEAD_DIM, BLOCK_N, 0, NUM_WARPS, ELEM_BITS)
+    PAD_IV: gl.constexpr = pad_interval(ELEM_BITS)
     # K is read transposed -- a [HEAD_DIM, BLOCK_N] tile whose dim 0 (the head dim) is
     # the contiguous one -- while V keeps its natural [BLOCK_N, HEAD_DIM] shape.
-    kt_src: gl.constexpr = dma_source_layout(HEAD_DIM, BLOCK_N, 0, NUM_WARPS, KV_VEC)
-    v_src: gl.constexpr = dma_source_layout(BLOCK_N, HEAD_DIM, 1, NUM_WARPS, KV_VEC)
-    kt_shared: gl.constexpr = dma_shared_layout(HEAD_DIM, BLOCK_N, 0, pad=8)
-    v_shared: gl.constexpr = dma_shared_layout(BLOCK_N, HEAD_DIM, 1, pad=32)
+    if IS_FP8:
+        # At 8-bit the stagger built below is not the one the transposed read wants,
+        # so defer to the compiler's own chooser and derive the matching copy-source
+        # layout from the bases it returns.
+        kt_shared: gl.constexpr = cdna4_ops.compute_efficient_padded_shared_layout(
+            kt_dot_layout, [HEAD_DIM, BLOCK_N], DTYPE, is_k_contig=True
+        )
+        v_shared: gl.constexpr = cdna4_ops.compute_efficient_padded_shared_layout(
+            v_dot_layout, [BLOCK_N, HEAD_DIM], DTYPE, is_k_contig=False
+        )
+        kt_src: gl.constexpr = bases_to_source_layout(
+            kt_shared.offset_bases, KV_VEC, NUM_WARPS, [HEAD_DIM, BLOCK_N]
+        )
+        v_src: gl.constexpr = bases_to_source_layout(
+            v_shared.offset_bases, KV_VEC, NUM_WARPS, [BLOCK_N, HEAD_DIM]
+        )
+    else:
+        kt_shared: gl.constexpr = dma_shared_layout(
+            HEAD_DIM, BLOCK_N, 0, pad=QK_KW, interval=PAD_IV
+        )
+        v_shared: gl.constexpr = dma_shared_layout(
+            BLOCK_N, HEAD_DIM, 1, pad=32, interval=PAD_IV
+        )
+        kt_src: gl.constexpr = dma_source_layout(
+            HEAD_DIM, BLOCK_N, 0, NUM_WARPS, KV_VEC
+        )
+        v_src: gl.constexpr = dma_source_layout(BLOCK_N, HEAD_DIM, 1, NUM_WARPS, KV_VEC)
 
     PADDED_HEAD: gl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
-    QK_SCALE: gl.constexpr = SM_SCALE * 1.44269504089
     BUF_DEPTH: gl.constexpr = 2
-
-    # ---------------- program ids ----------------
-    start_m = gl.program_id(0)
-    off_h_q = gl.program_id(1)
-    off_z = gl.program_id(2)
-    GROUP_SIZE: gl.constexpr = HQ // HK
-    off_h_k = off_h_q // GROUP_SIZE
-
-    gl.assume(start_m >= 0)
-    gl.assume(off_h_q >= 0)
-    gl.assume(off_z >= 0)
 
     # ---------------- how many KV blocks does this workgroup touch? ----------------
     n_blocks = gl.cdiv(SEQLEN_K, BLOCK_N)
@@ -523,22 +653,22 @@ def _mha_fwd_gluon_kernel(
 
     if n_blocks <= 0:
         # Every row of this Q block is fully masked: write zeros to O and +inf to LSE.
-        offs_m_z = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_blocked)
-        offs_d_z = gl.arange(0, HEAD_DIM, layout=offs_d_blocked)
+        offs_m_z = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_o_blk)
+        offs_d_z = gl.arange(0, HEAD_DIM, layout=offs_d_o_blk)
         o_base_z = Out + off_z * stride_oz + off_h_q * stride_oh
         o_offs_z = offs_m_z[:, None] * stride_om + offs_d_z[None, :] * stride_on
         o_mask_z = offs_m_z[:, None] < SEQLEN_Q
         if PADDED_HEAD:
             o_mask_z = o_mask_z & (offs_d_z[None, :] < ACTUAL_HEAD_DIM)
         zeros = gl.zeros(
-            [BLOCK_M, HEAD_DIM], dtype=Out.dtype.element_ty, layout=q_blocked
+            [BLOCK_M, HEAD_DIM], dtype=Out.dtype.element_ty, layout=o_blocked
         )
         gl.amd.cdna4.buffer_store(zeros, o_base_z, o_offs_z, mask=o_mask_z)
         if WRITE_LSE:
             offs_l = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_lse)
             l_ptrs = L + (off_z * HQ + off_h_q) * SEQLEN_Q + offs_l
             # What a row that attends to nothing stores is caller-chosen, because
-            # the callers disagree: flash_attn_3 (fwd_prefill.py's `invalid_mask`
+            # the two hosts disagree: flash_attn_3 (fwd_prefill.py's `invalid_mask`
             # store) and aiter/test_mha_common.py::opus_ref_lse use -inf, while
             # mha.py's own forward writes 0.0 there.  Live rows are identical
             # either way.
@@ -576,7 +706,7 @@ def _mha_fwd_gluon_kernel(
         # Fold qk_scale into the Q operand once, here, rather than into every tile's
         # score matrix inside the loop.  q_dot lives in registers for every iteration,
         # so this is a single pass over 32 VGPRs.
-        q_dot = (q_dot.to(gl.float32) * QK_SCALE).to(DTYPE)
+        q_dot = (q_dot.to(gl.float32) * qk_scale).to(DTYPE)
 
     # ---------------- K / V shared memory and DMA addresses ----------------
     kt_smem = gl.allocate_shared_memory(
@@ -661,8 +791,8 @@ def _mha_fwd_gluon_kernel(
         async_cp.wait_group(2)  # K[0] has landed
         kt0 = async_cp.load_shared_relaxed(kt_smem.index(0), kt_dot_layout)
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma)
-        qk = mfma_cdna4(q_dot, kt0, qk)
-        m_run, p_c, alpha_c = _softmax_vec1(qk, m_i, QK_SCALE, SCALE_ON_Q)
+        qk = _mma(q_dot, kt0, qk, IS_FP8)
+        m_run, p_c, alpha_c = _softmax_vec1(qk, m_i, qk_scale, SCALE_ON_Q)
 
         gl.barrier()  # WAR: LRK[0]'s ds_read against K[2]'s write into the same slot
         _dma(kt_smem.index(0), k_base + 2 * kt_step, kt_off, k_head_mask, PADDED_HEAD)
@@ -702,10 +832,11 @@ def _mha_fwd_gluon_kernel(
                 kt_dot_layout,
                 v_dot_layout,
                 p_dot_layout,
-                QK_SCALE,
+                qk_scale,
                 SCALE_ON_Q,
                 DTYPE,
                 PADDED_HEAD,
+                IS_FP8,
                 BLOCK_M,
                 BLOCK_N,
             )
@@ -734,10 +865,11 @@ def _mha_fwd_gluon_kernel(
                 kt_dot_layout,
                 v_dot_layout,
                 p_dot_layout,
-                QK_SCALE,
+                qk_scale,
                 SCALE_ON_Q,
                 DTYPE,
                 PADDED_HEAD,
+                IS_FP8,
                 BLOCK_M,
                 BLOCK_N,
             )
@@ -770,10 +902,11 @@ def _mha_fwd_gluon_kernel(
                 kt_dot_layout,
                 v_dot_layout,
                 p_dot_layout,
-                QK_SCALE,
+                qk_scale,
                 SCALE_ON_Q,
                 DTYPE,
                 PADDED_HEAD,
+                IS_FP8,
                 BLOCK_M,
                 BLOCK_N,
             )
@@ -789,12 +922,12 @@ def _mha_fwd_gluon_kernel(
         s_nm1 = (nm1 % BUF_DEPTH).to(tl.int32)
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma)
-        qk = mfma_cdna4(q_dot, kt_dot, qk)
+        qk = _mma(q_dot, kt_dot, qk, IS_FP8)
         async_cp.wait_group(2)
         v_dot = async_cp.load_shared_relaxed(v_smem.index(s_nm3), v_dot_layout)
         acc, l_i, p_dot = _softmax_vec2(acc, l_i, p_c, alpha_c, p_dot_layout, DTYPE)
-        acc = mfma_cdna4(p_dot, v_dot, acc)
-        m_run, p_c, alpha_c = _softmax_vec1(qk, m_run, QK_SCALE, SCALE_ON_Q)
+        acc = _mma(p_dot, v_dot, acc, IS_FP8)
+        m_run, p_c, alpha_c = _softmax_vec1(qk, m_run, qk_scale, SCALE_ON_Q)
         gl.barrier()  # WAR: LRV[n-3] against V[n-1]'s write into the same slot
         _dma(
             v_smem.index(s_nm1), v_base + nm1 * v_step, v_off, v_head_mask, PADDED_HEAD
@@ -803,17 +936,17 @@ def _mha_fwd_gluon_kernel(
         kt_dot = async_cp.load_shared_relaxed(kt_smem.index(s_nm1), kt_dot_layout)
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma)
-        qk = mfma_cdna4(q_dot, kt_dot, qk)
+        qk = _mma(q_dot, kt_dot, qk, IS_FP8)
         async_cp.wait_group(1)
         v_dot = async_cp.load_shared_relaxed(v_smem.index(s_nm2), v_dot_layout)
         acc, l_i, p_dot = _softmax_vec2(acc, l_i, p_c, alpha_c, p_dot_layout, DTYPE)
-        acc = mfma_cdna4(p_dot, v_dot, acc)
-        m_run, p_c, alpha_c = _softmax_vec1(qk, m_run, QK_SCALE, SCALE_ON_Q)
+        acc = _mma(p_dot, v_dot, acc, IS_FP8)
+        m_run, p_c, alpha_c = _softmax_vec1(qk, m_run, qk_scale, SCALE_ON_Q)
 
         async_cp.wait_group(0)
         v_dot = async_cp.load_shared_relaxed(v_smem.index(s_nm1), v_dot_layout)
         acc, l_i, p_dot = _softmax_vec2(acc, l_i, p_c, alpha_c, p_dot_layout, DTYPE)
-        acc = mfma_cdna4(p_dot, v_dot, acc)
+        acc = _mma(p_dot, v_dot, acc, IS_FP8)
 
         m_i = m_run
         tail_start = n_full_blocks
@@ -898,7 +1031,7 @@ def _mha_fwd_gluon_kernel(
             start_n = blk * BLOCK_N
             kt = async_cp.load_shared_relaxed(kt_smem.index(cur), kt_dot_layout)
             qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma)
-            qk = mfma_cdna4(q_dot, kt, qk)
+            qk = _mma(q_dot, kt, qk, IS_FP8)
 
             # Only blocks past the unmasked range need masking.  When this loop runs
             # the whole range most of its tiles are full, and the two `where`s would
@@ -912,11 +1045,11 @@ def _mha_fwd_gluon_kernel(
                         offs_m[:, None] >= causal_bound[None, :], qk, float("-inf")
                     )
 
-            m_i, p, alpha = _softmax_vec1(qk, m_i, QK_SCALE, SCALE_ON_Q)
+            m_i, p, alpha = _softmax_vec1(qk, m_i, qk_scale, SCALE_ON_Q)
             acc, l_i, p_dot = _softmax_vec2(acc, l_i, p, alpha, p_dot_layout, DTYPE)
 
             v = async_cp.load_shared_relaxed(v_smem.index(cur), v_dot_layout)
-            acc = mfma_cdna4(p_dot, v, acc)
+            acc = _mma(p_dot, v, acc, IS_FP8)
             gl.barrier()  # WAR: this tile's LDS reads against the next prefetch's writes
         async_cp.wait_group(0)
 
@@ -924,6 +1057,14 @@ def _mha_fwd_gluon_kernel(
     # Reciprocal on the [BLOCK_M] vector rather than on the [BLOCK_M, HEAD_DIM]
     # accumulator: a full IEEE divide per accumulator element costs ~4 VALU ops each.
     l_recip = 1.0 / l_i
+    if IS_FP8:
+        # v_descale is loop-invariant, so folding it in here is algebraically the
+        # same as the reference's per-tile multiply but rounds once instead of
+        # n_blocks times -- and it leaves the mfma(p, v, acc) chain untouched.  It
+        # rides on the [BLOCK_M] vector, not the [BLOCK_M, HEAD_DIM] accumulator.
+        # Guarded rather than relying on v_descale == 1.0 folding, so the 16-bit
+        # path emits byte-identical code to before this parameter existed.
+        l_recip = l_recip * v_descale
     acc = acc * l_recip[:, None]
 
     if IS_CAUSAL:
@@ -953,15 +1094,229 @@ def _mha_fwd_gluon_kernel(
     # through LDS, and doing it in fp16/bf16 halves the bytes that round trip.  The
     # blocked destination gives every lane 8 contiguous elements of one row, i.e. one
     # dwordx4 store instead of the MFMA layout's four strided dwordx2.
-    offs_d_o = gl.arange(0, HEAD_DIM, layout=offs_d_blocked)
-    offs_m_o = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_blocked)
+    offs_d_o = gl.arange(0, HEAD_DIM, layout=offs_d_o_blk)
+    offs_m_o = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_o_blk)
     o_base = Out + off_z * stride_oz + off_h_q * stride_oh
     o_offs = offs_m_o[:, None] * stride_om + offs_d_o[None, :] * stride_on
     o_mask = offs_m_o[:, None] < SEQLEN_Q
     if PADDED_HEAD:
         o_mask = o_mask & (offs_d_o[None, :] < ACTUAL_HEAD_DIM)
-    acc_out = gl.convert_layout(acc.to(Out.dtype.element_ty), q_blocked)
+    acc_out = gl.convert_layout(acc.to(Out.dtype.element_ty), o_blocked)
     gl.amd.cdna4.buffer_store(acc_out, o_base, o_offs, mask=o_mask)
+
+
+# ---------------------------------------------------------------------------
+# Kernel entry points
+# ---------------------------------------------------------------------------
+
+
+@gluon.jit
+def _mha_fwd_bf16_kernel(
+    Q,
+    K,
+    V,
+    Out,
+    L,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_on,
+    SM_SCALE: gl.constexpr,
+    HQ: gl.constexpr,
+    HK: gl.constexpr,
+    SEQLEN_Q: gl.constexpr,
+    SEQLEN_K: gl.constexpr,
+    ACTUAL_HEAD_DIM: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    IS_CAUSAL: gl.constexpr,
+    WRITE_LSE: gl.constexpr,
+    DEAD_ROW_LSE: gl.constexpr,
+    DTYPE: gl.constexpr,
+    PIPELINED: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """16-bit (bf16 / fp16) dense forward.
+
+    There are no descales, and the softmax scale is a compile-time constant, so it
+    is folded into the Q operand once before the loop (``SCALE_ON_Q``) instead of
+    into every tile's score matrix.  ``qk_scale`` still reaches the body because
+    the Q fold needs it; being a constexpr expression it costs nothing.
+    """
+    start_m, off_h_q, off_h_k, off_z = _program_ids(HQ, HK)
+    QK_SCALE: gl.constexpr = SM_SCALE * 1.44269504089  # * log2(e)
+    _mha_fwd_body(
+        Q,
+        K,
+        V,
+        Out,
+        L,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_on,
+        start_m,
+        off_h_q,
+        off_h_k,
+        off_z,
+        QK_SCALE,
+        1.0,  # v_descale -- unused, IS_FP8 gates the epilogue fold
+        HQ,
+        SEQLEN_Q,
+        SEQLEN_K,
+        ACTUAL_HEAD_DIM,
+        HEAD_DIM,
+        IS_CAUSAL,
+        WRITE_LSE,
+        DEAD_ROW_LSE,
+        DTYPE,
+        True,  # SCALE_ON_Q
+        PIPELINED,
+        BLOCK_M,
+        BLOCK_N,
+        NUM_WARPS,
+    )
+
+
+@gluon.jit
+def _mha_fwd_fp8_kernel(
+    Q,
+    K,
+    V,
+    Out,
+    L,
+    Q_Descale,
+    K_Descale,
+    V_Descale,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_on,
+    stride_dqz,
+    stride_dkz,
+    stride_dvz,
+    SM_SCALE: gl.constexpr,
+    HQ: gl.constexpr,
+    HK: gl.constexpr,
+    SEQLEN_Q: gl.constexpr,
+    SEQLEN_K: gl.constexpr,
+    ACTUAL_HEAD_DIM: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    IS_CAUSAL: gl.constexpr,
+    WRITE_LSE: gl.constexpr,
+    DEAD_ROW_LSE: gl.constexpr,
+    DTYPE: gl.constexpr,
+    PIPELINED: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """fp8 (e4m3) dense forward.
+
+    The three descales are fp32 ``[batch, nheads_k]`` with the head axis
+    contiguous, so only their batch stride is passed.  All three are indexed by
+    ``off_h_k`` -- which equals ``off_h_q`` when ``HQ == HK`` -- matching
+    ``_triton_kernels/flash_attn_triton_amd/fwd_prefill.py``.  They are workgroup
+    scalars, so this is three s_loads outside the loop.
+
+    Q cannot absorb the softmax scale the way the 16-bit path does (it is fp8, and
+    scaling it would quantise twice), so ``SCALE_ON_Q`` is off and the scale rides
+    into the softmax instead, carrying the Q and K descales with it.  The V descale
+    only ever multiplies ``acc``, so it is loop-invariant and folds into the
+    epilogue rather than into every tile.
+
+    P is cast straight to fp8 with no rescale and no clamp: the reference hard-codes
+    ``FP8_P_DESCALE = False``, and p is already in [0, 1] after the exp2.
+    """
+    start_m, off_h_q, off_h_k, off_z = _program_ids(HQ, HK)
+
+    q_descale = gl.load(Q_Descale + off_z * stride_dqz + off_h_k)
+    k_descale = gl.load(K_Descale + off_z * stride_dkz + off_h_k)
+    v_descale = gl.load(V_Descale + off_z * stride_dvz + off_h_k)
+
+    # log2(e) folded in here so the softmax's exp2 needs no further scaling.
+    qk_scale = SM_SCALE * q_descale * k_descale * 1.44269504089
+
+    _mha_fwd_body(
+        Q,
+        K,
+        V,
+        Out,
+        L,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_on,
+        start_m,
+        off_h_q,
+        off_h_k,
+        off_z,
+        qk_scale,
+        v_descale,
+        HQ,
+        SEQLEN_Q,
+        SEQLEN_K,
+        ACTUAL_HEAD_DIM,
+        HEAD_DIM,
+        IS_CAUSAL,
+        WRITE_LSE,
+        DEAD_ROW_LSE,
+        DTYPE,
+        False,  # SCALE_ON_Q -- an fp8 Q cannot absorb the scale
+        PIPELINED,
+        BLOCK_M,
+        BLOCK_N,
+        NUM_WARPS,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -985,7 +1340,11 @@ _SCHED_ATTR = ("amdgpu-sched-strategy", "iterative-minreg")
 
 _LLVM_FN_ATTRS = (_AGPR_ATTR, _SCHED_ATTR)
 
-_ELEM_BITS = 16
+
+def _elem_bits(torch_dtype) -> int:
+    """Storage width of one element, in bits -- the host-side twin of
+    :func:`elem_bits_of`, which cannot be called outside a Gluon context."""
+    return torch.finfo(torch_dtype).bits
 
 
 # (BLOCK_M, BLOCK_N, num_warps) per masking mode, tuned on gfx950 with
@@ -1002,24 +1361,40 @@ _TILE_CAUSAL = (128, 64, 4)
 # falls back.  Non-causal needs no such floor.
 _CAUSAL_MIN_AVG_FULL_BLOCKS = 24
 
+# Largest fp8 head dim that fits in LDS with the tiles above: measured 65,536 B at
+# d=64, 131,072 B at d=128, 262,144 B at d=192 and d=256, against a 163,840 B
+# limit, so d >= 192 does not launch.  Temporary -- that is ~2x what the *16-bit*
+# kernel needs for the same shape (68,016 B at d=128) despite fp8 elements being
+# half as wide, and the shared layouts were checked to cover exactly rows*cols with
+# ~3% padding at both widths.  So this is an allocation inefficiency to chase, not
+# a real requirement; d=256 should be the largest fp8 win once it lifts.
+_FP8_MAX_HEAD_DIM = 128
+
 
 def _tile(causal: bool) -> tuple[int, int, int]:
-    """(BLOCK_M, BLOCK_N, num_warps) for this masking mode."""
+    """(BLOCK_M, BLOCK_N, num_warps) for this masking mode.
+
+    fp8 shares these for now.  They were tuned at 16-bit and the balance does
+    shift -- the fp8 MFMA covers 4x the K per issue while the softmax VALU work is
+    unchanged -- so a sweep may want to split them later; BLOCK_N=128 is the lever
+    and becomes affordable at fp8.
+    """
     return _TILE_CAUSAL if causal else _TILE_NON_CAUSAL
 
 
-def _pick_tile(head_dim, block_n, num_warps, warp_size=64, dma_vec_elems=8):
+def _pick_tile(head_dim, block_n, num_warps, elem_bits, warp_size=64):
     """Pick (padded head dim, BLOCK_N) so the K/V tiles can be DMA'd into LDS.
 
-    ``buffer_load_to_shared`` hands every lane 16 contiguous bytes, so a K or V
-    tile needs at least ``8 * num_warps * warp_size`` elements.  A small head dim
-    buys those either by widening the tile along the KV axis (free -- the extra
-    columns are real work) or by padding the head dim (wasted MFMA).  Widen first,
-    and only pad once BLOCK_N would exceed 128, where the score tile starts to
-    dominate the register budget.
+    ``buffer_load_to_shared`` hands every lane 16 contiguous *bytes*, so a K or V
+    tile needs at least ``(128 // elem_bits) * num_warps * warp_size`` elements --
+    8 per lane at 16-bit, 16 at fp8.  A small head dim buys those either by
+    widening the tile along the KV axis (free -- the extra columns are real work)
+    or by padding the head dim (wasted MFMA).  Widen first, and only pad once
+    BLOCK_N would exceed 128, where the score tile starts to dominate the register
+    budget.
     """
     padded = max(1 << (head_dim - 1).bit_length(), 16)
-    need_n = dma_vec_elems * num_warps * warp_size // padded
+    need_n = (128 // elem_bits) * num_warps * warp_size // padded
     while need_n > 128:
         padded *= 2
         need_n //= 2
@@ -1064,7 +1439,7 @@ def _use_pipeline(sq, sk, block_m, block_n, causal):
     return avg_full >= (8 if masked == 0 else 20)
 
 
-def _fits_arch_vgprs(head_dim, block_m, block_n, num_warps, warp_size=64):
+def _fits_arch_vgprs(head_dim, block_m, block_n, num_warps, elem_bits, warp_size=64):
     """Does one wave's live set fit in the 256 architected VGPRs?
 
     ``waves_per_eu=2`` and the two LLVM attributes all hang on this and stand or
@@ -1072,12 +1447,17 @@ def _fits_arch_vgprs(head_dim, block_m, block_n, num_warps, warp_size=64):
     alone is ``head_dim / 2`` registers per lane, because ``BLOCK_M`` cancels
     against ``num_warps``.  Head dims that do not fit take the whole register file,
     the AGPRs, and no ping-pong.
+
+    Only the operand terms scale with ``elem_bits`` -- the accumulator and the
+    score tiles are fp32 whatever the inputs are.  ``slack`` was calibrated at
+    16-bit; see risk R4 in the fp8 plan if head_dim=256 spills.
     """
     lanes = num_warps * warp_size
+    per_reg = 32 // elem_bits  # input elements per 32-bit VGPR
     acc = head_dim // 2  # [BLOCK_M, HEAD_DIM] fp32
-    q_operand = head_dim // 4  # [BLOCK_M, HEAD_DIM] 16-bit
-    scores = 2 * block_m * block_n // lanes  # qk plus the carried p
-    kv = head_dim * block_n // lanes // 2  # one K or V tile, 16-bit
+    q_operand = head_dim // 2 // per_reg  # [BLOCK_M, HEAD_DIM] at elem_bits
+    scores = 2 * block_m * block_n // lanes  # qk plus the carried p, fp32
+    kv = head_dim * block_n // lanes // per_reg  # one K or V tile, at elem_bits
     slack = 24  # addresses, masks, m_i / l_i
     return acc + q_operand + scores + kv + slack <= 256
 
@@ -1108,28 +1488,21 @@ def is_available() -> bool:
     return arch_info.get_arch() == "gfx950"
 
 
-def gluon_fwd_supported(
+def _geometry_supported(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool,
-    *,
-    layout: str = "bshd",
-    **unsupported: object,
+    layout: str,
+    min_head_dim: int,
 ) -> bool:
-    """Can -- and should -- this shape go through the Gluon forward kernel?
+    """The shape conditions both dtypes share -- can this kernel express the shape,
+    and is it expected to beat the fallback on it?
 
-    Every keyword in ``unsupported`` is a feature the kernel does not implement
-    (cu_seqlens, page_table, qv, descales, rotary, ...); any of them being set is an
-    immediate no.  Taking them as ``**kwargs`` rather than enumerating them keeps the
-    caller honest: a new argument added to ``flash_attn_3.fwd`` disqualifies the
-    Gluon path until someone handles it deliberately.
+    Everything here is about geometry and the register/LDS budget; the dtype
+    admission itself is the caller's job.
     """
-    if any(value is not None and value is not False for value in unsupported.values()):
-        return False
     if layout not in ("bshd", "bhsd"):
-        return False
-    if q.dtype not in _TL_DTYPE or not (q.dtype == k.dtype == v.dtype):
         return False
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         return False
@@ -1141,14 +1514,17 @@ def gluon_fwd_supported(
     head_dim = q.shape[-1]
     if v.shape[-1] != head_dim or head_dim > 256 or head_dim % 16 != 0:
         return False
+    if head_dim < min_head_dim:
+        return False
 
     _, hq, hk, sq, sk, _, _ = _shape_and_strides(q, k, v, q, layout)
     if hq % hk != 0:
         return False
 
+    elem_bits = _elem_bits(q.dtype)
     block_m, block_n, num_warps = _tile(causal)
-    padded_head_dim, block_n = _pick_tile(head_dim, block_n, num_warps)
-    if not dma_layouts_ok(padded_head_dim, block_n, num_warps, _ELEM_BITS):
+    padded_head_dim, block_n = _pick_tile(head_dim, block_n, num_warps, elem_bits)
+    if not dma_layouts_ok(padded_head_dim, block_n, num_warps, elem_bits):
         return False
 
     if causal:
@@ -1159,7 +1535,9 @@ def gluon_fwd_supported(
         # accumulator alone is half the register file runs everything through the
         # generic loop, which has no answer on causal.  (Those head dims still win
         # on non-causal, where the DMA and layout work pays.)
-        if not _fits_arch_vgprs(padded_head_dim, block_m, block_n, num_warps):
+        if not _fits_arch_vgprs(
+            padded_head_dim, block_m, block_n, num_warps, elem_bits
+        ):
             return False
         # Second, the sequence has to be long enough.  avg_full_blocks accounts for
         # sq != sk and the bottom-right alignment, so the crossover holds for
@@ -1171,9 +1549,87 @@ def gluon_fwd_supported(
     return True
 
 
+def gluon_fwd_supported(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    *,
+    layout: str = "bshd",
+    **unsupported: object,
+) -> bool:
+    """Can -- and should -- this 16-bit shape go through the Gluon forward kernel?
+
+    Every keyword in ``unsupported`` is a feature the kernel does not implement
+    (cu_seqlens, page_table, qv, descales, rotary, ...); any of them being set is an
+    immediate no.  Taking them as ``**kwargs`` rather than enumerating them keeps the
+    caller honest: a new argument added to the caller disqualifies the Gluon path
+    until someone handles it deliberately.
+    """
+    if any(value is not None and value is not False for value in unsupported.values()):
+        return False
+    if q.dtype not in _TL_DTYPE or not (q.dtype == k.dtype == v.dtype):
+        return False
+    return _geometry_supported(q, k, v, causal, layout, min_head_dim=16)
+
+
+def _descale_ok(descale: torch.Tensor | None, batch: int, hk: int) -> bool:
+    """An fp8 descale must be fp32 ``[batch, nheads_k]`` with the head axis
+    contiguous -- the kernel indexes it as ``base + z * stride(0) + h_k`` and
+    passes no head stride."""
+    return (
+        isinstance(descale, torch.Tensor)
+        and descale.dtype == torch.float32
+        and descale.shape == (batch, hk)
+        and descale.stride(1) == 1
+    )
+
+
+def gluon_fp8_fwd_supported(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    *,
+    layout: str = "bshd",
+    **unsupported: object,
+) -> bool:
+    """Can -- and should -- this fp8 shape go through the Gluon forward kernel?
+
+    fp8 is admitted by the *presence* of all three descales, in the exact layout the
+    kernel indexes; 16-bit is admitted by their absence (see
+    :func:`gluon_fwd_supported`).
+
+    ``head_dim >= 64`` because the scaled MFMA is 32x32x64 and needs ``K % 32 == 0``.
+    ``head_dim <= _FP8_MAX_HEAD_DIM`` is an LDS bound -- see that constant.
+    """
+    if any(value is not None and value is not False for value in unsupported.values()):
+        return False
+    fp8 = get_fp8_e4m3_dtype()
+    if q.dtype != fp8 or not (q.dtype == k.dtype == v.dtype):
+        return False
+    if q.dim() != 4:
+        return False
+    if q.shape[-1] > _FP8_MAX_HEAD_DIM:
+        return False
+    batch, _, hk, _, _, _, _ = _shape_and_strides(q, k, v, q, layout)
+    if not all(_descale_ok(d, batch, hk) for d in (q_descale, k_descale, v_descale)):
+        return False
+    return _geometry_supported(q, k, v, causal, layout, min_head_dim=64)
+
+
 def _gl_dtype(torch_dtype):
     """torch dtype -> the Gluon dtype the kernel wants."""
-    return {torch.float16: gl.float16, torch.bfloat16: gl.bfloat16}[torch_dtype]
+    return {
+        torch.float16: gl.float16,
+        torch.bfloat16: gl.bfloat16,
+        # gfx950 e4m3 is the OCP "fn" form; gfx942's "fnuz" is a different type and
+        # is not reachable here (is_available() gates on CDNA4).
+        torch.float8_e4m3fn: gl.float8e4nv,
+    }[torch_dtype]
 
 
 def gluon_mha_fwd(
@@ -1186,7 +1642,7 @@ def gluon_mha_fwd(
     out: torch.Tensor | None = None,
     dead_row_lse: float = float("-inf"),
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dense FlashAttention forward on gfx950.
+    """Dense 16-bit FlashAttention forward on gfx950.
 
     Returns ``(out, softmax_lse)`` in exactly the form ``flash_attn_3.fwd``
     produces for the dense path: ``out`` shaped like ``q`` in ``q.dtype``, and
@@ -1204,9 +1660,10 @@ def gluon_mha_fwd(
         out = torch.empty_like(q)
     batch, hq, hk, sq, sk, head_dim, strides = _shape_and_strides(q, k, v, out, layout)
 
+    elem_bits = _elem_bits(q.dtype)
     block_m, block_n, num_warps = _tile(causal)
-    padded_head_dim, block_n = _pick_tile(head_dim, block_n, num_warps)
-    fits = _fits_arch_vgprs(padded_head_dim, block_m, block_n, num_warps)
+    padded_head_dim, block_n = _pick_tile(head_dim, block_n, num_warps, elem_bits)
+    fits = _fits_arch_vgprs(padded_head_dim, block_m, block_n, num_warps, elem_bits)
     pipelined = fits and _use_pipeline(sq, sk, block_m, block_n, causal)
 
     lse = torch.empty((batch, hq, sq), device=q.device, dtype=torch.float32)
@@ -1218,7 +1675,7 @@ def gluon_mha_fwd(
     )
 
     grid = (triton.cdiv(sq, block_m), hq, batch)
-    _mha_fwd_gluon_kernel[grid](
+    _mha_fwd_bf16_kernel[grid](
         q,
         k,
         v,
@@ -1239,7 +1696,6 @@ def gluon_mha_fwd(
         WRITE_LSE=True,
         DEAD_ROW_LSE=dead_row_lse,
         DTYPE=_gl_dtype(q.dtype),
-        SCALE_ON_Q=True,
         PIPELINED=pipelined,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
@@ -1248,6 +1704,90 @@ def gluon_mha_fwd(
         waves_per_eu=2 if fits else 1,
         # Both attributes or neither; head dims that need the AGPRs keep LLVM's
         # default schedule (see _SCHED_ATTR).
+        llvm_fn_attrs=_LLVM_FN_ATTRS if fits else (),
+    )
+    return out, lse
+
+
+def gluon_mha_fwd_fp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    layout: str = "bshd",
+    out: torch.Tensor | None = None,
+    dead_row_lse: float = float("-inf"),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dense fp8 (e4m3) FlashAttention forward on gfx950.
+
+    Returns ``(out, softmax_lse)`` in exactly the form ``flash_attn_3.fwd``
+    produces for the fp8 dense path: ``out`` in **fp32** (not q.dtype -- fp8 has no
+    useful output range), and ``softmax_lse`` shaped ``[batch, nheads_q, seqlen_q]``
+    in fp32.  The LSE is in descaled units: it includes
+    ``q_descale * k_descale * softmax_scale`` and excludes ``v_descale``, which is
+    what the reference produces and what the fp8 backward expects.
+
+    Only each descale's batch stride is passed; the head axis must be contiguous.
+
+    Call :func:`gluon_fp8_fwd_supported` first; this function assumes it passed.
+    """
+    if out is None:
+        out = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+    batch, hq, hk, sq, sk, head_dim, strides = _shape_and_strides(q, k, v, out, layout)
+
+    elem_bits = _elem_bits(q.dtype)
+    block_m, block_n, num_warps = _tile(causal)
+    padded_head_dim, block_n = _pick_tile(head_dim, block_n, num_warps, elem_bits)
+    fits = _fits_arch_vgprs(padded_head_dim, block_m, block_n, num_warps, elem_bits)
+    pipelined = fits and _use_pipeline(sq, sk, block_m, block_n, causal)
+
+    lse = torch.empty((batch, hq, sq), device=q.device, dtype=torch.float32)
+    q_st, k_st, v_st, o_st = strides
+
+    _LOGGER.info(
+        f"MHA_FWD_FP8 [gluon/{arch_info.get_arch()}]: q={tuple(q.shape)} "
+        f"k={tuple(k.shape)} causal={causal} block_m={block_m} block_n={block_n} "
+        f"pipelined={pipelined}"
+    )
+
+    grid = (triton.cdiv(sq, block_m), hq, batch)
+    _mha_fwd_fp8_kernel[grid](
+        q,
+        k,
+        v,
+        out,
+        lse,
+        q_descale,
+        k_descale,
+        v_descale,
+        *q_st,
+        *k_st,
+        *v_st,
+        *o_st,
+        q_descale.stride(0),
+        k_descale.stride(0),
+        v_descale.stride(0),
+        SM_SCALE=softmax_scale,
+        HQ=hq,
+        HK=hk,
+        SEQLEN_Q=sq,
+        SEQLEN_K=sk,
+        ACTUAL_HEAD_DIM=head_dim,
+        HEAD_DIM=padded_head_dim,
+        IS_CAUSAL=causal,
+        WRITE_LSE=True,
+        DEAD_ROW_LSE=dead_row_lse,
+        DTYPE=_gl_dtype(q.dtype),
+        PIPELINED=pipelined,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        NUM_WARPS=num_warps,
+        num_warps=num_warps,
+        waves_per_eu=2 if fits else 1,
         llvm_fn_attrs=_LLVM_FN_ATTRS if fits else (),
     )
     return out, lse

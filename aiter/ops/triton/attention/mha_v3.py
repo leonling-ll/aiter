@@ -6,9 +6,53 @@ from __future__ import annotations
 import torch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._gluon_kernels.gfx950.attention import mha_fwd as _gluon_fwd
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import is_fp8
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+
+if not _gluon_fwd.is_available():
+    _gluon_fwd = None
+
+
+def _use_gluon_fp8_fwd(
+    q,
+    k,
+    v,
+    causal,
+    q_descale,
+    k_descale,
+    v_descale,
+    *,
+    window_size=(-1, -1),
+    softcap=0.0,
+    attention_chunk=0,
+    sm_margin=0,
+    **rejected,
+) -> bool:
+    """Should this fp8 dense forward go through the Gluon kernel?
+
+    Each unsupported feature is passed through as a truthy entry that the predicate
+    rejects, so a feature added to flash_attn_3 later disqualifies the Gluon path
+    until someone handles it explicitly.
+    """
+    if _gluon_fwd is None:
+        return False
+    return _gluon_fwd.gluon_fp8_fwd_supported(
+        q,
+        k,
+        v,
+        causal,
+        q_descale,
+        k_descale,
+        v_descale,
+        layout="bshd",
+        window=window_size[0] >= 0 or window_size[1] >= 0,
+        softcap=softcap != 0.0,
+        attention_chunk=attention_chunk not in (0, 1),
+        sm_margin=sm_margin != 0,
+        **rejected,
+    )
 
 
 class _FlashAttnV3Func(torch.autograd.Function):
@@ -51,8 +95,8 @@ class _FlashAttnV3Func(torch.autograd.Function):
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in AMD Triton v3")
 
-        # The 16-bit Gluon dispatch lives in mha.py::flash_attn_func, alongside the
-        # 16-bit public entry point; this path is always flash_attn_3.
+        # The 16-bit Gluon dispatch used to sit here; it now lives in
+        # mha.py::flash_attn_func, alongside the 16-bit public entry point.
         out, softmax_lse, _, _ = flash_attn_3.fwd(
             q,
             k,
@@ -916,43 +960,71 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
                 "sm_margin != 0 not supported in FP8 high-precision API"
             )
 
-        # Call flash attention forward
-        out, softmax_lse, _, _ = flash_attn_3.fwd(
+        # Both paths return fp32 `out` and fp32 [batch, hq, sq] `softmax_lse` in the
+        # same convention -- the LSE in descaled units, including
+        # q_descale * k_descale * softmax_scale and excluding v_descale -- so the
+        # saved-tensor backward below is unaffected by which one ran.
+        if _use_gluon_fp8_fwd(
             q_fp8,
             k_fp8,
             v_fp8,
-            None,
-            None,
-            None,
-            None,  # k_new, v_new, qv, out
-            None,
-            None,
-            None,  # cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new
-            None,
-            None,
-            None,
-            None,  # seqused_q, seqused_k, max_seqlen_q, max_seqlen_k
-            None,
-            None,
-            None,  # page_table, kv_batch_idx, leftpad_k
-            None,
-            None,
-            None,  # rotary_cos, rotary_sin, seqlens_rotary
+            causal,
             q_descale,
             k_descale,
             v_descale,
-            softmax_scale,
-            causal,
-            int(window_size[0]),
-            int(window_size[1]),
-            attention_chunk,
-            softcap,
-            False,  # rotary_interleaved
-            None,
-            1,
-            None,
-            sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
-        )
+            window_size=window_size,
+            softcap=softcap,
+            attention_chunk=attention_chunk,
+            sm_margin=sm_margin,
+        ):
+            out, softmax_lse = _gluon_fwd.gluon_mha_fwd_fp8(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                q_descale,
+                k_descale,
+                v_descale,
+                softmax_scale,
+                causal,
+            )
+        else:
+            # Call flash attention forward
+            out, softmax_lse, _, _ = flash_attn_3.fwd(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                None,
+                None,
+                None,
+                None,  # k_new, v_new, qv, out
+                None,
+                None,
+                None,  # cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new
+                None,
+                None,
+                None,
+                None,  # seqused_q, seqused_k, max_seqlen_q, max_seqlen_k
+                None,
+                None,
+                None,  # page_table, kv_batch_idx, leftpad_k
+                None,
+                None,
+                None,  # rotary_cos, rotary_sin, seqlens_rotary
+                q_descale,
+                k_descale,
+                v_descale,
+                softmax_scale,
+                causal,
+                int(window_size[0]),
+                int(window_size[1]),
+                attention_chunk,
+                softcap,
+                False,  # rotary_interleaved
+                None,
+                1,
+                None,
+                sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+            )
 
         # Save tensors needed for backward
         ctx.save_for_backward(
