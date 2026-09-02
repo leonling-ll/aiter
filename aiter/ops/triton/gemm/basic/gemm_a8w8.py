@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils._dsr1_untuned_shape_logger import dump_untuned_shape
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import (
@@ -85,7 +86,13 @@ def gemm_a8w8(
         if backend == "gluon":
             config, _ = get_gemm_config("GEMM-A8W8", M, N, K, backend="gluon")
         else:
-            config, _ = _get_config(M, N, K)
+            config, is_tuned = _get_config(M, N, K)
+            if not is_tuned:
+                dump_untuned_shape(
+                    "dsr1_a8w8_untuned_gemm.csv",
+                    ["M", "N", "K", "q_dtype_w"],
+                    (M, N, K, str(w.dtype)),
+                )
 
     if y is None and (config.get("NUM_KSPLIT", 1) == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)

@@ -8,6 +8,7 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils._dsr1_untuned_shape_logger import dump_untuned_shape
 
 
 def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
@@ -86,7 +87,13 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             ), "Output dimension error"
 
     if config is None:
-        config, _ = _get_config(M, N, K)
+        config, is_tuned = _get_config(M, N, K)
+        if not is_tuned:
+            dump_untuned_shape(
+                "dsr1_a8w8_untuned_batched_gemm.csv",
+                ["B", "M", "N", "K"],
+                (B, M, N, K),
+            )
     config["BLOCK_SIZE_K"] = group_size
 
     grid = lambda META: (
