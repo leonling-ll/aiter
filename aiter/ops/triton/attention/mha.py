@@ -296,7 +296,6 @@ def _gluon_flash_attn_forward(
     sliding_window = _get_sliding_window_size(window_size)
 
     IS_FP8 = types._is_fp8(q)
-    FP8_MAX = torch.finfo(q.dtype).max if IS_FP8 else 0.0
 
     qk_head_dim = q.shape[-1]
     v_head_dim = v.shape[-1]
@@ -495,14 +494,15 @@ def _gluon_flash_attn_forward(
         NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         IS_FP8=IS_FP8,
-        FP8_MAX=FP8_MAX,
         ENABLE_SINK=sink is not None,
         SLIDING_WINDOW=sliding_window,
         RETURN_SCORES=return_softmax,
         HEAD_STRIDE_ALIGN=head_stride_align,
         KV_STRIDE_ALIGN=kv_stride_align,
-        # fp8 keeps the per-tile scale: q is already fp8, so re-rounding q*scale back
-        # into fp8 would throw away far more than the multiply costs.
+        # fp8 scales inside the loop instead: q is already fp8, so re-rounding
+        # q*scale back into fp8 would throw away far more than the multiply costs.
+        # The kernel contracts that multiply into the exp2 argument's fma, so it
+        # costs one op per score element rather than two.
         SCALE_ON_Q=not IS_FP8,
         **config,
     )

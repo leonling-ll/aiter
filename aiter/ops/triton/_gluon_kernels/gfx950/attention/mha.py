@@ -30,18 +30,43 @@ from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_asy
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.mha_kernel_utils import (
-    _compute_fp8_scaling_factors,
-)
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.config_utils import (
     AITER_TRITON_CONFIGS_PATH,
     load_config_json,
 )
 
-# Padding interval, in elements, of the K/V shared layouts. 512 elements = 1 KB of
-# 16-bit data, the granularity the AMD Triton backend itself pads at.
-_PAD_INTERVAL = 512
+# Padding geometry of the K/V shared layouts, in BYTES.
+#
+# 1 KB is the granularity the AMD Triton backend itself pads at.  The two pads differ
+# because the reads do: K^T is read along its contiguous axis (``ds_read_b128``)
+# while V is read across it by the hardware-transposing ``ds_read_b64_tr_bN``.
+#
+# Denominated in bytes rather than elements so one set of numbers covers every
+# operand width: at 2 bytes this is the 512-element interval with pads 8 / 32 that
+# the 16-bit path has always used, and at 1 byte it is 1024 with pads 16 / 64.  The
+# tutorial's own GEMMs pad on the same 1 KB byte interval at both widths --
+# ``kernels/gemm/inter_wave/a16w16`` uses [[512, 16]] and ``.../a8w8`` [[1024, 16],
+# [2048, 32]].
+_PAD_INTERVAL_BYTES = 1024
+_KT_PAD_BYTES = 16
+_V_PAD_BYTES = 64
+
+# fp8 carries the softmax numerator pre-scaled by 2**_FP8_P_BIAS.
+#
+# `p = exp2(qk - rowmax(qk))` lies in [0, 1] by construction -- the running max
+# dominates every element of the tile -- so an unscaled fp8 `p` would use only the
+# NEGATIVE half of e4m3's exponent range and throw the rest away.  Biasing the exp2
+# argument by a constant fills that range, and 256 is the largest power of two that
+# still clears e4m3's 448 maximum, so nothing ever overflows.
+#
+# Being a power of two makes the bias exact: it costs nothing (it folds into the
+# [BLOCK_M] row-max vector, not the [BLOCK_M, BLOCK_N] tile), and it cancels again in
+# the epilogue between `acc` and `l_i`, which are both carried in the scaled units.
+# That is what lets P@V accumulate straight into `acc` instead of into a separate
+# `pv` tile that has to be descaled and added -- see the epilogue and `_sc_vec1`.
+_FP8_P_BIAS = gl.constexpr(8.0)
+_FP8_P_SCALE = gl.constexpr(256.0)
 
 
 @gluon.constexpr_function
@@ -57,7 +82,13 @@ def _contig_strided(rows, cols, contig_dim):
 
 
 @gluon.constexpr_function
-def _padded_staggered_layout(rows, cols, contig_dim, pad, interval=_PAD_INTERVAL):
+def _pad_interval(elem_bytes):
+    """The 1 KB padding interval, in elements of this width."""
+    return _PAD_INTERVAL_BYTES // elem_bytes
+
+
+@gluon.constexpr_function
+def _padded_staggered_layout(rows, cols, contig_dim, pad, interval):
     """Row-staggered padded shared layout for a K^T or V staging tile.
 
     Both tiles are written along their contiguous axis but read back by the MFMA
@@ -83,15 +114,17 @@ def _padded_staggered_layout(rows, cols, contig_dim, pad, interval=_PAD_INTERVAL
 
 
 @gluon.constexpr_function
-def _staggered_layout_ok(head_dim_pow2, block_n, elem_bytes, interval=_PAD_INTERVAL):
+def _staggered_layout_ok(head_dim_pow2, block_n, elem_bytes):
     """Can the staggered layout be built for this tile pair?
 
     The bases above enumerate every bit of both axes exactly once, which needs both
     extents to be powers of two, and the strided axis has to split evenly across the
     padding intervals. Anything else keeps the old swizzled layout.
+
+    Width-agnostic: the interval is a byte count, so 8-bit operands get the same
+    geometry over twice as many elements.
     """
-    if elem_bytes != 2:
-        return False
+    interval = _pad_interval(elem_bytes)
     if head_dim_pow2 & (head_dim_pow2 - 1) or block_n & (block_n - 1):
         return False
     if head_dim_pow2 < 16 or block_n < 16:
@@ -109,11 +142,16 @@ def _make_kv_shared_layouts(
     """LDS layouts for the K/V staging tiles.
 
     Prefers the conflict-free row-staggered padded layout; falls back to the
-    analytic swizzle for tiles it cannot describe (fp8, non-power-of-two extents).
+    analytic swizzle for tiles it cannot describe (non-power-of-two extents).
     """
     if block_n and _staggered_layout_ok(head_dim_pow2, block_n, elem_bytes):
-        k_shared = _padded_staggered_layout(head_dim_pow2, block_n, 0, pad=8)
-        v_shared = _padded_staggered_layout(block_n, head_dim_pow2, 1, pad=32)
+        interval = _pad_interval(elem_bytes)
+        k_shared = _padded_staggered_layout(
+            head_dim_pow2, block_n, 0, _KT_PAD_BYTES // elem_bytes, interval
+        )
+        v_shared = _padded_staggered_layout(
+            block_n, head_dim_pow2, 1, _V_PAD_BYTES // elem_bytes, interval
+        )
         return k_shared, v_shared
 
     bank_line_bytes = banks * 4
@@ -459,14 +497,12 @@ def _attn_qk(
     start_n,
     offs_n,
     window_min,
-    qk_scale,
     mfmaLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HAS_PE: gl.constexpr,
     IS_FP8: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
-    SCALE_ON_Q: gl.constexpr = False,
     seqlen_q=None,
     seqlen_k=None,
     block_max=None,
@@ -475,9 +511,14 @@ def _attn_qk(
     IS_CAUSAL: gl.constexpr = False,
     MASK_STEPS: gl.constexpr = False,
 ):
-    """QK^T + scale + mask for one already-staged key block. ``k`` is already in
-    its MFMA dot-operand layout; returns float32 scores in ``mfmaLayout``. For
-    FP8 the QK^T uses the CDNA4 scaled MFMA (32x32x64).
+    """QK^T + mask for one already-staged key block. ``k`` is already in its MFMA
+    dot-operand layout; returns float32 scores in ``mfmaLayout``. For FP8 the QK^T
+    uses the CDNA4 scaled MFMA (32x32x64).
+
+    The scores come back UNSCALED.  When the scale was not already folded into Q,
+    the caller's softmax contracts it into the exp2 argument's ``fma`` rather than
+    paying a separate pass over the tile; ``qk_scale`` is positive, so deferring it
+    past the row max and past the ``-inf`` the mask writes changes neither.
     """
     qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
     if IS_FP8:
@@ -488,9 +529,6 @@ def _attn_qk(
         if HAS_PE:
             qk = gl.amd.cdna4.mfma(q_pe, k_pe, qk)
         qk = gl.amd.cdna4.mfma(q, k, qk)
-
-    if not SCALE_ON_Q:
-        qk = qk * qk_scale
 
     if MASK_STEPS or IS_CAUSAL or SLIDING_WINDOW > 0:
         key_pos = start_n + offs_n
@@ -518,7 +556,7 @@ def _attn_softmax_pv(
     m_i,
     qk,
     v,
-    descale_v,
+    qk_scale,
     sd_base,
     sd_offsets,
     sd_q_mask,
@@ -527,27 +565,30 @@ def _attn_softmax_pv(
     seqlen_k,
     stride_sd_n,
     dotP: gl.constexpr,
-    mfmaLayout: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_DMODEL_POW2: gl.constexpr,
     IS_FP8: gl.constexpr,
-    FP8_MAX: gl.constexpr,
+    P_BIAS: gl.constexpr,
+    SCALE_ON_Q: gl.constexpr,
     RETURN_SCORES: gl.constexpr,
 ):
     """Online-softmax rescale + P@V accumulation for one key block.
     Returns updated (acc, l_i, m_i)."""
 
-    m_ij = gl.maximum(m_i, gl.max(qk, 1))
-    p = gl.exp2(qk - m_ij[:, None])
-    alpha = gl.exp2(m_i - m_ij)
+    # Same numerator as the pipeline's VEC1 -- row max, exp2 burst, alpha -- including
+    # the fused scale and fp8's constant exponent bias.
+    m_ij, p, alpha = _sc_vec1(qk, m_i, qk_scale, SCALE_ON_Q, P_BIAS)
     l_ij = gl.sum(p, 1)
 
     if RETURN_SCORES:
         # NOTE: the returned score is not the same as the reference because we
         # need to adjust as we find new maxes per block. We are not doing that
         p_mask = sd_q_mask[:, None] & ((start_n + offs_n)[None, :] < seqlen_k)
+        if P_BIAS != 0.0:
+            # Undo the fp8 bias: what this buffer means is the unscaled numerator.
+            p_out = p * (1.0 / _FP8_P_SCALE)
+        else:
+            p_out = p
         gl.amd.cdna4.buffer_store(
-            p.to(sd_base.dtype.element_ty),
+            p_out.to(sd_base.dtype.element_ty),
             ptr=sd_base + start_n * stride_sd_n,
             offsets=sd_offsets,
             mask=p_mask,
@@ -555,16 +596,14 @@ def _attn_softmax_pv(
 
     acc = acc * alpha[:, None]
 
+    # Both branches accumulate straight into `acc`; they differ only in the MFMA
+    # opcode.  fp8 can do that because its P scale is the loop-invariant constant
+    # above, so the descale factors out of the whole accumulation and is applied
+    # once in the epilogue.
+    p = gl.convert_layout(p.to(v.dtype), layout=dotP, assert_trivial=True)
     if IS_FP8:
-        scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
-        p = gl.convert_layout(
-            (p * scale_p).to(v.dtype), layout=dotP, assert_trivial=True
-        )
-        pv = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=mfmaLayout)
-        pv = gl.amd.cdna4.mfma_scaled(p, None, "e4m3", v, None, "e4m3", pv)
-        acc = acc + pv * (descale_p * descale_v)
+        acc = gl.amd.cdna4.mfma_scaled(p, None, "e4m3", v, None, "e4m3", acc)
     else:
-        p = gl.convert_layout(p.to(v.dtype), layout=dotP, assert_trivial=True)
         acc = gl.amd.cdna4.mfma(p, v, acc)
 
     l_i = l_i * alpha + l_ij
@@ -603,25 +642,78 @@ _MIN_PIPE_BLOCKS = gl.constexpr(8)
 
 
 @gluon.jit
-def _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q: gl.constexpr):
+def _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q: gl.constexpr, P_BIAS: gl.constexpr):
     """VEC1 -- softmax numerator: new row max, the exp2 burst, and alpha.
 
     Placed in the ``dot2`` cluster.  ``exp2`` is a TRANS op and issues at half the
     rate of a plain VALU, so it is the most expensive item in the softmax and wants
     the roomier of the two shadows.  Its results are consumed one stage later.
+
+    ``P_BIAS`` is fp8's constant exponent shift (see ``_FP8_P_BIAS``).  It rides on
+    the [BLOCK_M] row-max vector, never on the [BLOCK_M, BLOCK_N] tile, so it costs
+    one VALU op per tile rather than one per element -- and in the ``not SCALE_ON_Q``
+    branch fp8 always takes, it is absorbed into the ``fma``'s addend for free.
     """
     if SCALE_ON_Q:
         # qk already carries the scale (folded into Q once, before the loop), so the
         # row max needs no multiply and the exponent argument is a plain subtract.
         m_new = gl.maximum(m_run, gl.max(qk, 1))
-        p = gl.exp2(qk - m_new[:, None])
+        if P_BIAS != 0.0:
+            p = gl.exp2(qk - (m_new - P_BIAS)[:, None])
+        else:
+            p = gl.exp2(qk - m_new[:, None])
     else:
         m_new = gl.maximum(m_run, gl.max(qk, 1) * qk_scale)
         # Fused at the source (one llvm.fmuladd) rather than left as an fmul/fsub
         # pair for the backend to contract after scheduling has already counted it.
-        p = gl.exp2(gl.fma(qk, qk_scale, -m_new[:, None]))
+        if P_BIAS != 0.0:
+            p = gl.exp2(gl.fma(qk, qk_scale, (P_BIAS - m_new)[:, None]))
+        else:
+            p = gl.exp2(gl.fma(qk, qk_scale, -m_new[:, None]))
     alpha = gl.exp2(m_run - m_new)
     return m_new, p, alpha
+
+
+@gluon.jit
+def _pipe_qk(
+    q_dot,
+    kt_dot,
+    q_pe,
+    kpe_dot,
+    mfmaLayout: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    HAS_PE: gl.constexpr,
+    IS_FP8: gl.constexpr,
+):
+    """One tile's Q@K^T, with the PE slice folded into the same accumulator.
+
+    Factored out only so the fp8/non-fp8 opcode choice lives in one place instead of
+    at each of the pipeline's eight matrix sites.
+    """
+    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
+    if IS_FP8:
+        if HAS_PE:
+            qk = gl.amd.cdna4.mfma_scaled(q_pe, None, "e4m3", kpe_dot, None, "e4m3", qk)
+        qk = gl.amd.cdna4.mfma_scaled(q_dot, None, "e4m3", kt_dot, None, "e4m3", qk)
+    else:
+        if HAS_PE:
+            qk = gl.amd.cdna4.mfma(q_pe, kpe_dot, qk)
+        qk = gl.amd.cdna4.mfma(q_dot, kt_dot, qk)
+    return qk
+
+
+@gluon.jit
+def _pipe_pv(acc, p_dot, v_dot, IS_FP8: gl.constexpr):
+    """One tile's P@V, accumulated in place.
+
+    fp8 accumulates into ``acc`` exactly like every other dtype: its P scale is the
+    loop-invariant ``_FP8_P_BIAS``, so there is no per-tile descale to apply here.
+    """
+    if IS_FP8:
+        return gl.amd.cdna4.mfma_scaled(p_dot, None, "e4m3", v_dot, None, "e4m3", acc)
+    else:
+        return gl.amd.cdna4.mfma(p_dot, v_dot, acc)
 
 
 @gluon.jit
@@ -670,6 +762,8 @@ def _attn_fwd_pipelined(
     DTYPE: gl.constexpr,
     HAS_MASK: gl.constexpr,
     HAS_PE: gl.constexpr,
+    IS_FP8: gl.constexpr,
+    P_BIAS: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BUF_DEPTH: gl.constexpr,
@@ -713,12 +807,14 @@ def _attn_fwd_pipelined(
 
     cdna4_async.wait_group(2)  # K[0] has landed
     kt0 = cdna4_async.load_shared_relaxed(smemK.index(0), dotK)
-    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
     if HAS_PE:
         kpe0 = cdna4_async.load_shared_relaxed(smemKpe.index(0), dotK)
-        qk = gl.amd.cdna4.mfma(q_pe, kpe0, qk)
-    qk = gl.amd.cdna4.mfma(q_dot, kt0, qk)
-    m_run, p_c, alpha_c = _sc_vec1(qk, m_i, qk_scale, SCALE_ON_Q)
+    else:
+        # _pipe_qk needs a real tensor in every instantiation, so without a PE slice
+        # this aliases K rather than carrying None; the HAS_PE branch drops it.
+        kpe0 = kt0
+    qk = _pipe_qk(q_dot, kt0, q_pe, kpe0, mfmaLayout, BLOCK_M, BLOCK_N, HAS_PE, IS_FP8)
+    m_run, p_c, alpha_c = _sc_vec1(qk, m_i, qk_scale, SCALE_ON_Q, P_BIAS)
 
     gl.barrier()  # WAR: tile 0's ds_read against K[2]'s write into the same slot
     _async_copy_k_group(
@@ -751,10 +847,17 @@ def _attn_fwd_pipelined(
 
         # even tile (blk): LDS slots cur=0, next=1
         with warp_pipeline_stage("dot1"):
-            qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-            if HAS_PE:
-                qk = gl.amd.cdna4.mfma(q_pe, kpe_dot, qk)
-            qk = gl.amd.cdna4.mfma(q_dot, kt_dot, qk)  # dot_qk
+            qk = _pipe_qk(  # dot_qk
+                q_dot,
+                kt_dot,
+                q_pe,
+                kpe_dot,
+                mfmaLayout,
+                BLOCK_M,
+                BLOCK_N,
+                HAS_PE,
+                IS_FP8,
+            )
             acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)  # VEC2
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem1"):
@@ -771,8 +874,10 @@ def _attn_fwd_pipelined(
                 HAS_PE,
             )
         with warp_pipeline_stage("dot2"):
-            acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)  # dot_pv
-            m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)  # VEC1
+            acc = _pipe_pv(acc, p_dot, v_dot, IS_FP8)  # dot_pv
+            m_run, p_c, alpha_c = _sc_vec1(
+                qk, m_run, qk_scale, SCALE_ON_Q, P_BIAS
+            )  # VEC1
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem2"):
             kt_dot = cdna4_async.load_shared_relaxed(smemK.index(0), dotK)  # LRK
@@ -789,10 +894,17 @@ def _attn_fwd_pipelined(
 
         # odd tile (blk + 1): LDS slots cur=1, next=0
         with warp_pipeline_stage("dot1"):
-            qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-            if HAS_PE:
-                qk = gl.amd.cdna4.mfma(q_pe, kpe_dot, qk)
-            qk = gl.amd.cdna4.mfma(q_dot, kt_dot, qk)  # dot_qk
+            qk = _pipe_qk(  # dot_qk
+                q_dot,
+                kt_dot,
+                q_pe,
+                kpe_dot,
+                mfmaLayout,
+                BLOCK_M,
+                BLOCK_N,
+                HAS_PE,
+                IS_FP8,
+            )
             acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)  # VEC2
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem1"):
@@ -809,8 +921,10 @@ def _attn_fwd_pipelined(
                 HAS_PE,
             )
         with warp_pipeline_stage("dot2"):
-            acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)  # dot_pv
-            m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)  # VEC1
+            acc = _pipe_pv(acc, p_dot, v_dot, IS_FP8)  # dot_pv
+            m_run, p_c, alpha_c = _sc_vec1(
+                qk, m_run, qk_scale, SCALE_ON_Q, P_BIAS
+            )  # VEC1
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem2"):
             kt_dot = cdna4_async.load_shared_relaxed(smemK.index(1), dotK)  # LRK
@@ -832,10 +946,17 @@ def _attn_fwd_pipelined(
 
         # tail tile: LDS slots cur=0, next=1
         with warp_pipeline_stage("dot1"):
-            qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-            if HAS_PE:
-                qk = gl.amd.cdna4.mfma(q_pe, kpe_dot, qk)
-            qk = gl.amd.cdna4.mfma(q_dot, kt_dot, qk)  # dot_qk
+            qk = _pipe_qk(  # dot_qk
+                q_dot,
+                kt_dot,
+                q_pe,
+                kpe_dot,
+                mfmaLayout,
+                BLOCK_M,
+                BLOCK_N,
+                HAS_PE,
+                IS_FP8,
+            )
             acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)  # VEC2
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem1"):
@@ -852,8 +973,10 @@ def _attn_fwd_pipelined(
                 HAS_PE,
             )
         with warp_pipeline_stage("dot2"):
-            acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)  # dot_pv
-            m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)  # VEC1
+            acc = _pipe_pv(acc, p_dot, v_dot, IS_FP8)  # dot_pv
+            m_run, p_c, alpha_c = _sc_vec1(
+                qk, m_run, qk_scale, SCALE_ON_Q, P_BIAS
+            )  # VEC1
         cdna4_async.wait_group(1)
         with warp_pipeline_stage("mem2"):
             kt_dot = cdna4_async.load_shared_relaxed(smemK.index(0), dotK)  # LRK
@@ -876,15 +999,14 @@ def _attn_fwd_pipelined(
     s_nm2 = (nm2 % BUF_DEPTH).to(gl.int32)
     s_nm1 = (nm1 % BUF_DEPTH).to(gl.int32)
 
-    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-    if HAS_PE:
-        qk = gl.amd.cdna4.mfma(q_pe, kpe_dot, qk)
-    qk = gl.amd.cdna4.mfma(q_dot, kt_dot, qk)
+    qk = _pipe_qk(
+        q_dot, kt_dot, q_pe, kpe_dot, mfmaLayout, BLOCK_M, BLOCK_N, HAS_PE, IS_FP8
+    )
     cdna4_async.wait_group(2)
     v_dot = cdna4_async.load_shared_relaxed(smemV.index(s_nm3), dotV)
     acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)
-    acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)
-    m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)
+    acc = _pipe_pv(acc, p_dot, v_dot, IS_FP8)
+    m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q, P_BIAS)
     gl.barrier()  # WAR: tile n-3's V read against V[n-1]'s write into that slot
     _async_copy_tile(smemV.index(s_nm1), v_base + nm1 * v_step, v_off, v_mask, HAS_MASK)
     cdna4_async.commit_group()  # ACV
@@ -893,20 +1015,19 @@ def _attn_fwd_pipelined(
     if HAS_PE:
         kpe_dot = cdna4_async.load_shared_relaxed(smemKpe.index(s_nm1), dotK)
 
-    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfmaLayout)
-    if HAS_PE:
-        qk = gl.amd.cdna4.mfma(q_pe, kpe_dot, qk)
-    qk = gl.amd.cdna4.mfma(q_dot, kt_dot, qk)
+    qk = _pipe_qk(
+        q_dot, kt_dot, q_pe, kpe_dot, mfmaLayout, BLOCK_M, BLOCK_N, HAS_PE, IS_FP8
+    )
     cdna4_async.wait_group(1)
     v_dot = cdna4_async.load_shared_relaxed(smemV.index(s_nm2), dotV)
     acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)
-    acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)
-    m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)
+    acc = _pipe_pv(acc, p_dot, v_dot, IS_FP8)
+    m_run, p_c, alpha_c = _sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q, P_BIAS)
 
     cdna4_async.wait_group(0)
     v_dot = cdna4_async.load_shared_relaxed(smemV.index(s_nm1), dotV)
     acc, l_i, p_dot = _sc_vec2(acc, l_i, p_c, alpha_c, dotP, DTYPE)
-    acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)
+    acc = _pipe_pv(acc, p_dot, v_dot, IS_FP8)
 
     return acc, l_i, m_run
 
@@ -941,7 +1062,6 @@ def _attn_fwd_inner(
     block_max,
     window_min,
     qk_scale,
-    descale_v,
     sd_base,
     sd_offsets,
     sd_q_mask,
@@ -960,7 +1080,7 @@ def _attn_fwd_inner(
     BLOCK_DMODEL_PE: gl.constexpr,
     HAS_PE: gl.constexpr,
     IS_FP8: gl.constexpr,
-    FP8_MAX: gl.constexpr,
+    P_BIAS: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
     RETURN_SCORES: gl.constexpr,
     SCALE_ON_Q: gl.constexpr,
@@ -1108,14 +1228,12 @@ def _attn_fwd_inner(
             start_n,
             offs_n,
             window_min,
-            qk_scale,
             mfmaLayout=mfmaLayout,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
             SLIDING_WINDOW=SLIDING_WINDOW,
-            SCALE_ON_Q=SCALE_ON_Q,
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k,
             block_max=block_max,
@@ -1130,7 +1248,7 @@ def _attn_fwd_inner(
             m_i,
             qk,
             v,
-            descale_v,
+            qk_scale,
             sd_base,
             sd_offsets,
             sd_q_mask,
@@ -1139,11 +1257,9 @@ def _attn_fwd_inner(
             seqlen_k,
             stride_sd_n,
             dotP,
-            mfmaLayout,
-            BLOCK_M,
-            BLOCK_DMODEL_POW2,
             IS_FP8,
-            FP8_MAX,
+            P_BIAS,
+            SCALE_ON_Q,
             RETURN_SCORES,
         )
 
@@ -1236,7 +1352,6 @@ def _attn_fwd(
     NUM_XCD: gl.constexpr,
     USE_INT64_STRIDES: gl.constexpr,
     IS_FP8: gl.constexpr,
-    FP8_MAX: gl.constexpr,
     ENABLE_SINK: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
     RETURN_SCORES: gl.constexpr,
@@ -1388,6 +1503,11 @@ def _attn_fwd(
         descale_q = 1.0
         descale_k = 1.0
         descale_v = 1.0
+
+    # fp8 carries `p` (and therefore `l_i` and `acc`) pre-scaled by 2**P_BIAS; see
+    # the note on _FP8_P_BIAS.  Zero for every other dtype, which makes each use of it
+    # below a dead constexpr branch there.
+    P_BIAS: gl.constexpr = _FP8_P_BIAS if IS_FP8 else 0.0
 
     MFMA_INSTR: gl.constexpr = [32, 32, 64] if IS_FP8 else [32, 32, 16]
     mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -1681,8 +1801,24 @@ def _attn_fwd(
         v_head_mask = None
 
     # online-softmax state.
+    #
+    # fp8 keeps the sink OUT of the running max.  The sink is a logit with no key
+    # behind it, so seeding m_i with it is free at 16 bits -- but under fp8 m_i is
+    # the exponent every `p` is measured against, and a sink above the score range
+    # drives the WHOLE tile below e4m3's smallest subnormal (2**-9 relative to the
+    # 2**P_BIAS scale).  Every p then flushes to zero and the output collapses to
+    # zero with it; measured cosine against the reference falls from 0.998 to 0 as
+    # the sink passes ~15 nats.  Merging the sink into the denominator in the
+    # epilogue instead leaves m_i sitting on the scores, where e4m3's range is
+    # fully used.  The two are algebraically identical.
+    SINK_IN_EPILOGUE: gl.constexpr = ENABLE_SINK and IS_FP8
     if ENABLE_SINK:
-        m_i_init = gl.load(sink_ptr + off_q_head).to(gl.float32) * RCP_LN2
+        sink_log2 = gl.load(sink_ptr + off_q_head).to(gl.float32) * RCP_LN2
+    else:
+        sink_log2 = 0.0
+
+    if ENABLE_SINK and not SINK_IN_EPILOGUE:
+        m_i_init = sink_log2
     elif SLIDING_WINDOW > 0:
         # A sliding-window block can be fully masked for some rows, and -inf as the
         # running max would then make exp2(-inf - m_i) NaN. A finite floor keeps the
@@ -1694,8 +1830,18 @@ def _attn_fwd(
     m_i = gl.full(
         [BLOCK_M], m_i_init, dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
     )
+    # The 1.0 is the attention sink's own weight, exp2(sink - m_i) at m_i == sink.
+    # Without a sink it is annihilated by the first alpha (m_i starts at -inf, so
+    # alpha is 0) and the value is irrelevant -- but WITH one it survives, so it has
+    # to be stated in the same 2**P_BIAS units as every other numerator or the sink
+    # comes out underweighted by that factor.  (Under SINK_IN_EPILOGUE the sink is
+    # added at the end instead, and this init is annihilated as in the no-sink case.)
+    if IS_FP8:
+        l_i_init = _FP8_P_SCALE
+    else:
+        l_i_init = 1.0
     l_i = gl.full(
-        [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
+        [BLOCK_M], l_i_init, dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
     )
     acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=mfmaLayout)
 
@@ -1830,9 +1976,14 @@ def _attn_fwd(
         v_base += skipped_blocks * BLOCK_N * stride_vn
 
     # The rotated pipeline is a dense-path specialisation: it carries no per-element
-    # masking and no fp8 rescale, so it only takes the configurations whose full
-    # blocks are plain Q@K^T / P@V.  Everything it declines -- and every masked block
-    # in every configuration -- goes to the generic loop below.
+    # masking, so it only takes the configurations whose full blocks are an
+    # unconditional Q@K^T / P@V.  Everything it declines -- and every masked block in
+    # every configuration -- goes to the generic loop below.
+    #
+    # fp8 qualifies: with a constant P scale its inner loop is the same shape as
+    # bf16's, differing only in the MFMA opcode (see _pipe_qk / _pipe_pv) and in the
+    # constant exponent bias VEC1 folds into its fma.  It used to be excluded because
+    # the per-tile adaptive rescale had nowhere to live in the four clusters.
     #
     # The PE slice rides with K through the pipeline: same commit group in mem1,
     # read beside it in mem2, consumed beside it in dot1.  It is implemented but
@@ -1844,7 +1995,6 @@ def _attn_fwd(
     PE_IN_PIPELINE: gl.constexpr = False
     FAST_PATH: gl.constexpr = (
         USE_ASYNC_COPY
-        and (not IS_FP8)
         and (not RETURN_SCORES)
         and SLIDING_WINDOW == 0
         and (PE_IN_PIPELINE or not HAS_PE)
@@ -1885,6 +2035,8 @@ def _attn_fwd(
                 DTYPE=v_ptr.dtype.element_ty,
                 HAS_MASK=PADDED_HEAD,
                 HAS_PE=HAS_PE,
+                IS_FP8=IS_FP8,
+                P_BIAS=P_BIAS,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 BUF_DEPTH=BUF_DEPTH,
@@ -1926,7 +2078,6 @@ def _attn_fwd(
             block_max,
             window_min,
             qk_scale,
-            descale_v,
             sd_base,
             sd_offsets,
             sd_q_mask,
@@ -1945,7 +2096,7 @@ def _attn_fwd(
             BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
             HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
+            P_BIAS=P_BIAS,
             SLIDING_WINDOW=SLIDING_WINDOW,
             RETURN_SCORES=RETURN_SCORES,
             SCALE_ON_Q=SCALE_ON_Q,
@@ -1988,7 +2139,6 @@ def _attn_fwd(
             block_max,
             window_min,
             qk_scale,
-            descale_v,
             sd_base,
             sd_offsets,
             sd_q_mask,
@@ -2007,7 +2157,7 @@ def _attn_fwd(
             BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
             HAS_PE=HAS_PE,
             IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
+            P_BIAS=P_BIAS,
             SLIDING_WINDOW=SLIDING_WINDOW,
             RETURN_SCORES=RETURN_SCORES,
             SCALE_ON_Q=SCALE_ON_Q,
@@ -2024,7 +2174,25 @@ def _attn_fwd(
     # multiply, rather than dividing the [BLOCK_M, BLOCK_DMODEL] accumulator: a full
     # IEEE divide expands to several VALU ops *per accumulator element*, and there are
     # BLOCK_DMODEL of them per row.
-    acc = acc * (1.0 / l_i)[:, None]
+    # fp8 folds descale_v in here: `acc` accumulated raw fp8 V, and the 2**P_BIAS on
+    # `p` cancels between `acc` and `l_i`, so one extra multiply on the [BLOCK_M]
+    # vector settles the whole tile.
+    if SINK_IN_EPILOGUE:
+        # Merge the sink in now, at the true row max.  Both rescale factors are
+        # exp2 of a non-positive argument, so neither can overflow, and a fully
+        # masked row (m_i still at its floor) gets r == 0 and a denominator of the
+        # sink alone -- output 0, LSE == the sink, which is what that row means.
+        m_new = gl.maximum(m_i, sink_log2)
+        r = gl.exp2(m_i - m_new)
+        l_i = l_i * r + _FP8_P_SCALE * gl.exp2(sink_log2 - m_new)
+        m_i = m_new
+        # `r` rides along in the single [BLOCK_M, BLOCK_DMODEL] multiply the epilogue
+        # already pays, so merging the sink costs no pass over the accumulator.
+        acc = acc * ((r / l_i) * descale_v)[:, None]
+    elif IS_FP8:
+        acc = acc * ((1.0 / l_i) * descale_v)[:, None]
+    else:
+        acc = acc * (1.0 / l_i)[:, None]
 
     # If seqlen_q > seqlen_k but the delta is not a multiple of BLOCK_M,
     # then we have one block with a row of all NaNs which come from computing
@@ -2052,6 +2220,10 @@ def _attn_fwd(
         LN2: gl.constexpr = 0.6931471824645996
         # compute log-sum-exp in base 2 units
         softmax_lse = m_i + gl.log2(l_i)
+        if IS_FP8:
+            # l_i is 2**P_BIAS times the true denominator, and log2 turns that factor
+            # into a constant term.
+            softmax_lse = softmax_lse - P_BIAS
         # convert back to natural units
         softmax_lse = softmax_lse * LN2
 
@@ -2108,6 +2280,18 @@ def _get_config(
     fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
     fwd_cfg = load_config_json(fpath)["fwd"]
     if is_fp8:
+        # fp8 keeps the NARROW tile, which is the opposite of the bf16 choice above.
+        # Its 32x32x64 MFMA already carries four times the K depth per instruction,
+        # so a wave is not starved the way the bf16 narrow tile leaves it -- and with
+        # the matrix work that much cheaper the loop is VALU-bound, where halving the
+        # per-wave live set matters more than the extra wave per SIMD.  Measured
+        # faster than 256/8 on every shape tried.
+        #
+        # A 64-wide V head instead wants a WIDE BLOCK_N.  The per-tile accumulator
+        # rescale costs v_head_dim elements per row whatever BLOCK_N is, so doubling
+        # BLOCK_N halves that term -- and at d=64 it is a large share of the loop.
+        if v_head_dim and v_head_dim <= 64 and "fp8_narrow_v" in fwd_cfg:
+            return fwd_cfg["fp8_narrow_v"]
         return fwd_cfg["fp8"]
     elif has_pe:
         # The PE tile is bounded by the accumulator, which is [BLOCK_M, v_head_dim]
