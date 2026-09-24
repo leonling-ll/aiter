@@ -489,6 +489,40 @@ def _load_k_smem(smemK, smemKpe, dotK: gl.constexpr, HAS_PE: gl.constexpr):
 
 
 @gluon.jit
+def _mask_qk(
+    qk,
+    start_n,
+    offs_n,
+    offs_m,
+    window_min,
+    seqlen_q,
+    seqlen_k,
+    mfmaLayout: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BOUND: gl.constexpr,
+    IS_CAUSAL: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
+):
+    """Per-element visibility mask for one score tile: ``-inf`` where a key is hidden.
+
+    ``BOUND`` covers a partial final key block.  It is applied on every block rather
+    than only the last: on any earlier block ``key_pos < seqlen_k`` is uniformly
+    true, so the ``&`` is a no-op.
+    """
+    key_pos = start_n + offs_n
+    mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=mfmaLayout)
+    if BOUND:
+        mask = mask & (key_pos[None, :] < seqlen_k)
+    if IS_CAUSAL:
+        causal_boundary = key_pos + (seqlen_q - seqlen_k)
+        mask = mask & (offs_m[:, None] >= causal_boundary[None, :])
+    if SLIDING_WINDOW > 0:
+        mask = mask & (window_min[:, None] <= key_pos[None, :])
+    return gl.where(mask, qk, float("-inf"))
+
+
+@gluon.jit
 def _attn_qk(
     q,
     k,
@@ -505,8 +539,6 @@ def _attn_qk(
     SLIDING_WINDOW: gl.constexpr,
     seqlen_q=None,
     seqlen_k=None,
-    block_max=None,
-    n_extra_tokens=None,
     offs_m=None,
     IS_CAUSAL: gl.constexpr = False,
     MASK_STEPS: gl.constexpr = False,
@@ -531,20 +563,21 @@ def _attn_qk(
         qk = gl.amd.cdna4.mfma(q, k, qk)
 
     if MASK_STEPS or IS_CAUSAL or SLIDING_WINDOW > 0:
-        key_pos = start_n + offs_n
-        mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=mfmaLayout)
-        if MASK_STEPS:
-            # Only the last visible block can be partial (seqlen_k not a multiple
-            # of BLOCK_N).
-            bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
-            mask_partial = key_pos[None, :] < seqlen_k
-            mask = gl.where(bound_cond, mask_partial, mask)
-        if IS_CAUSAL:
-            causal_boundary = key_pos + (seqlen_q - seqlen_k)
-            mask = mask & (offs_m[:, None] >= causal_boundary[None, :])
-        if SLIDING_WINDOW > 0:
-            mask = mask & (window_min[:, None] <= key_pos[None, :])
-        qk = gl.where(mask, qk, float("-inf"))
+        qk = _mask_qk(
+            qk,
+            start_n,
+            offs_n,
+            offs_m,
+            window_min,
+            seqlen_q,
+            seqlen_k,
+            mfmaLayout,
+            BLOCK_M,
+            BLOCK_N,
+            MASK_STEPS,
+            IS_CAUSAL,
+            SLIDING_WINDOW,
+        )
 
     return qk
 
@@ -1087,7 +1120,6 @@ def _attn_fwd_inner(
     USE_ASYNC_COPY: gl.constexpr,
     BUF_DEPTH: gl.constexpr,
     seqlen_q=None,
-    n_extra_tokens=None,
     offs_m=None,
     IS_CAUSAL: gl.constexpr = False,
     MASK_STEPS: gl.constexpr = False,
@@ -1236,8 +1268,6 @@ def _attn_fwd_inner(
             SLIDING_WINDOW=SLIDING_WINDOW,
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k,
-            block_max=block_max,
-            n_extra_tokens=n_extra_tokens,
             offs_m=offs_m,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=MASK_STEPS,
@@ -1357,6 +1387,7 @@ def _attn_fwd(
     RETURN_SCORES: gl.constexpr,
     HEAD_STRIDE_ALIGN: gl.constexpr,
     KV_STRIDE_ALIGN: gl.constexpr = 1,
+    PIPE_REACHABLE: gl.constexpr = True,
     SCALE_ON_Q: gl.constexpr = False,
     num_warps: gl.constexpr = 4,
 ):
@@ -1803,14 +1834,13 @@ def _attn_fwd(
     # online-softmax state.
     #
     # fp8 keeps the sink OUT of the running max.  The sink is a logit with no key
-    # behind it, so seeding m_i with it is free at 16 bits -- but under fp8 m_i is
-    # the exponent every `p` is measured against, and a sink above the score range
-    # drives the WHOLE tile below e4m3's smallest subnormal (2**-9 relative to the
-    # 2**P_BIAS scale).  Every p then flushes to zero and the output collapses to
-    # zero with it; measured cosine against the reference falls from 0.998 to 0 as
-    # the sink passes ~15 nats.  Merging the sink into the denominator in the
-    # epilogue instead leaves m_i sitting on the scores, where e4m3's range is
-    # fully used.  The two are algebraically identical.
+    # behind it, so seeding m_i with it is harmless at 16 bits -- but under fp8 m_i
+    # sets the exponent every `p` is measured against, and a sink above the score
+    # range drives the whole tile below e4m3's smallest subnormal (2**-9 relative to
+    # the 2**P_BIAS scale).  Every p then flushes to zero and the output with it.
+    # Merging the sink into the denominator in the epilogue instead leaves m_i on
+    # the scores, where e4m3's range is fully used; the two are algebraically
+    # identical.
     SINK_IN_EPILOGUE: gl.constexpr = ENABLE_SINK and IS_FP8
     if ENABLE_SINK:
         sink_log2 = gl.load(sink_ptr + off_q_head).to(gl.float32) * RCP_LN2
@@ -2000,6 +2030,14 @@ def _attn_fwd(
         and (PE_IN_PIPELINE or not HAS_PE)
     )
 
+    # Carry one generic loop body instead of two.  When the pipeline runs, the
+    # generic loop only handles the masked tail, so sending that work through the
+    # masked instantiation lets the unmasked one be dropped entirely.  Both
+    # conditions are needed: without FAST_PATH, or on a sequence too short for the
+    # pipeline to run, the generic loop handles the bulk of the work and its full
+    # blocks need the cheaper unmasked form.
+    ONE_GENERIC_LOOP: gl.constexpr = FAST_PATH and PIPE_REACHABLE
+
     pipelined = False
     if FAST_PATH:  # noqa: SIM102
         # Checked per workgroup, not per launch: under a causal mask each M-block
@@ -2041,75 +2079,77 @@ def _attn_fwd(
                 BLOCK_N=BLOCK_N,
                 BUF_DEPTH=BUF_DEPTH,
             )
-            block_min = block_min + n_full_blocks * BLOCK_N
-            block_max = n_blocks * BLOCK_N
+            k_base += n_full_blocks * BLOCK_N * stride_kn
+            v_base += n_full_blocks * BLOCK_N * stride_vn
+            block_min += n_full_blocks * BLOCK_N
             # WAR: the pipeline's last LDS reads against whatever stages next.
             gl.barrier()
 
-    # Full blocks: no boundary mask, no causal mask.
-    if (not pipelined) and n_full_blocks > 0:
-        block_max = block_min + n_full_blocks * BLOCK_N
-        acc, l_i, m_i = _attn_fwd_inner(
-            acc,
-            l_i,
-            m_i,
-            q,
-            q_pe,
-            k_base,
-            k_offsets,
-            k_pe_offsets,
-            v_base,
-            v_offsets,
-            smemK,
-            smemKpe,
-            smemV,
-            kt_off,
-            kpe_off,
-            v_off,
-            kt_off_n,
-            kt_off_d,
-            kpe_off_n,
-            v_off_n,
-            v_off_d,
-            stride_kn,
-            stride_vn,
-            seqlen_k,
-            block_min,
-            block_max,
-            window_min,
-            qk_scale,
-            sd_base,
-            sd_offsets,
-            sd_q_mask,
-            stride_sd_n,
-            mfmaLayout=mfmaLayout,
-            dotK=dotK,
-            dotP=dotP,
-            dotV=dotV,
-            kLoadLayout=kLoadLayout,
-            kPeLoadLayout=kPeLoadLayout,
-            vLoadLayout=vLoadLayout,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-            BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
-            HAS_PE=HAS_PE,
-            IS_FP8=IS_FP8,
-            P_BIAS=P_BIAS,
-            SLIDING_WINDOW=SLIDING_WINDOW,
-            RETURN_SCORES=RETURN_SCORES,
-            SCALE_ON_Q=SCALE_ON_Q,
-            USE_ASYNC_COPY=USE_ASYNC_COPY,
-            BUF_DEPTH=BUF_DEPTH,
-        )
-        block_min = block_max
-        block_max = n_blocks * BLOCK_N
+    # Full blocks, unmasked -- only compiled when the generic loop carries the bulk.
+    if not ONE_GENERIC_LOOP:  # noqa: SIM102
+        if (not pipelined) and n_full_blocks > 0:
+            acc, l_i, m_i = _attn_fwd_inner(
+                acc,
+                l_i,
+                m_i,
+                q,
+                q_pe,
+                k_base,
+                k_offsets,
+                k_pe_offsets,
+                v_base,
+                v_offsets,
+                smemK,
+                smemKpe,
+                smemV,
+                kt_off,
+                kpe_off,
+                v_off,
+                kt_off_n,
+                kt_off_d,
+                kpe_off_n,
+                v_off_n,
+                v_off_d,
+                stride_kn,
+                stride_vn,
+                seqlen_k,
+                block_min,
+                block_min + n_full_blocks * BLOCK_N,
+                window_min,
+                qk_scale,
+                sd_base,
+                sd_offsets,
+                sd_q_mask,
+                stride_sd_n,
+                mfmaLayout=mfmaLayout,
+                dotK=dotK,
+                dotP=dotP,
+                dotV=dotV,
+                kLoadLayout=kLoadLayout,
+                kPeLoadLayout=kPeLoadLayout,
+                vLoadLayout=vLoadLayout,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_DMODEL=BLOCK_DMODEL,
+                BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+                BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
+                HAS_PE=HAS_PE,
+                IS_FP8=IS_FP8,
+                P_BIAS=P_BIAS,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                RETURN_SCORES=RETURN_SCORES,
+                SCALE_ON_Q=SCALE_ON_Q,
+                USE_ASYNC_COPY=USE_ASYNC_COPY,
+                BUF_DEPTH=BUF_DEPTH,
+            )
+            k_base += n_full_blocks * BLOCK_N * stride_kn
+            v_base += n_full_blocks * BLOCK_N * stride_vn
+            block_min += n_full_blocks * BLOCK_N
 
-    # Remaining blocks carry the boundary / causal masking.
-    if masked_blocks > 0:
-        k_base += n_full_blocks * BLOCK_N * stride_kn
-        v_base += n_full_blocks * BLOCK_N * stride_vn
+    # Everything the cursor has not reached: the masked tail, and under
+    # ONE_GENERIC_LOOP the full blocks too when the pipeline declined this
+    # workgroup.
+    if block_min < block_max:
         acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,
@@ -2164,7 +2204,6 @@ def _attn_fwd(
             USE_ASYNC_COPY=USE_ASYNC_COPY,
             BUF_DEPTH=BUF_DEPTH,
             seqlen_q=seqlen_q,
-            n_extra_tokens=n_extra_tokens,
             offs_m=offs_m,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=True,
@@ -2265,7 +2304,12 @@ def _attn_fwd(
 
 
 def _get_config(
-    is_fp8: bool, has_pe: bool = False, causal: bool = False, v_head_dim: int = 0
+    is_fp8: bool,
+    has_pe: bool = False,
+    causal: bool = False,
+    v_head_dim: int = 0,
+    return_scores: bool = False,
+    sliding_window: int = 0,
 ):
     """Tile / wave configuration for one masking + dtype mode.
 
@@ -2279,17 +2323,29 @@ def _get_config(
     arch = arch_info.get_arch()
     fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
     fwd_cfg = load_config_json(fpath)["fwd"]
+    # Modes the rotated pipeline never takes want a narrow tile.  The wide tile
+    # exists to feed that pipeline -- it puts two waves on a SIMD so one wave's
+    # vector work issues in the other's MFMA shadow -- and with no pipeline it is
+    # only a larger live set.  BLOCK_N stays 64 so fp8's 32x32x64 scaled MFMA still
+    # tiles the P@V contraction.
+    #
+    # Sliding window splits on the masking mode.  With causal, the visible range is
+    # clipped to the window while the masked tail stays BLOCK_M/BLOCK_N + 1 blocks,
+    # so a wide tile puts most of a short window through the masked loop.  Without
+    # causal the visible range grows with BLOCK_M and the wide tile is right, so it
+    # is left alone.
+    if "no_pipeline" in fwd_cfg and (return_scores or (sliding_window > 0 and causal)):
+        return fwd_cfg["no_pipeline"]
     if is_fp8:
-        # fp8 keeps the NARROW tile, which is the opposite of the bf16 choice above.
-        # Its 32x32x64 MFMA already carries four times the K depth per instruction,
-        # so a wave is not starved the way the bf16 narrow tile leaves it -- and with
-        # the matrix work that much cheaper the loop is VALU-bound, where halving the
-        # per-wave live set matters more than the extra wave per SIMD.  Measured
-        # faster than 256/8 on every shape tried.
+        # fp8 keeps the narrow tile, the opposite of the bf16 choice above.  Its
+        # 32x32x64 MFMA carries four times the K depth per instruction, so a wave is
+        # not starved the way the bf16 narrow tile leaves it, and with the matrix
+        # work that much cheaper the loop is VALU-bound -- where halving the
+        # per-wave live set matters more than the extra wave per SIMD.
         #
-        # A 64-wide V head instead wants a WIDE BLOCK_N.  The per-tile accumulator
+        # A 64-wide V head instead wants a wide BLOCK_N.  The per-tile accumulator
         # rescale costs v_head_dim elements per row whatever BLOCK_N is, so doubling
-        # BLOCK_N halves that term -- and at d=64 it is a large share of the loop.
+        # BLOCK_N halves that term, and at d=64 it is a large share of the loop.
         if v_head_dim and v_head_dim <= 64 and "fp8_narrow_v" in fwd_cfg:
             return fwd_cfg["fp8_narrow_v"]
         return fwd_cfg["fp8"]

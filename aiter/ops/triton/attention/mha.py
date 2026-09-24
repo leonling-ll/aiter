@@ -12,6 +12,9 @@ import triton.language as tl
 from packaging.version import Version
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    _MIN_PIPE_BLOCKS as _GLUON_MIN_PIPE_BLOCKS,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _attn_fwd as _gluon_attn_fwd,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
@@ -319,6 +322,8 @@ def _gluon_flash_attn_forward(
             has_pe=pe_head_dim > 0,
             causal=causal,
             v_head_dim=v_head_dim,
+            return_scores=return_softmax,
+            sliding_window=sliding_window,
         )
     config = dict(config)
     BLOCK_M = config.pop("BLOCK_M")
@@ -453,6 +458,14 @@ def _gluon_flash_attn_forward(
     else:
         kv_stride_align = 0
 
+    # Whether the rotated pipeline can run for this launch at all: it needs
+    # _MIN_PIPE_BLOCKS full tiles in a workgroup, and the masked tail takes
+    # BLOCK_M/BLOCK_N + 1 off the top, so a short sequence never reaches it.  The
+    # kernel uses this to choose how many generic loop bodies to carry.
+    pipe_reachable = triton.cdiv(seqlen_k, BLOCK_N) >= (
+        _GLUON_MIN_PIPE_BLOCKS.value + BLOCK_M // BLOCK_N + 1
+    )
+
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
     _gluon_attn_fwd[grid](
@@ -499,6 +512,7 @@ def _gluon_flash_attn_forward(
         RETURN_SCORES=return_softmax,
         HEAD_STRIDE_ALIGN=head_stride_align,
         KV_STRIDE_ALIGN=kv_stride_align,
+        PIPE_REACHABLE=pipe_reachable,
         # fp8 scales inside the loop instead: q is already fp8, so re-rounding
         # q*scale back into fp8 would throw away far more than the multiply costs.
         # The kernel contracts that multiply into the exp2 argument's fma, so it
