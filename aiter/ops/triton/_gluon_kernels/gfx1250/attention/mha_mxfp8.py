@@ -3,6 +3,8 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.extra.libdevice import fast_dividef
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @gluon.jit
 def fast_maximum(a, b):
@@ -151,18 +153,9 @@ def concat_subtile(x, y):
 
 
 @gluon.jit
-def split_subtile(x):
-    layout: gl.constexpr = x.type.layout
-    x_r = x.reshape(x.shape[0], 2, x.shape[1] // 2).permute(0, 2, 1)
-    x0, x1 = gl.split(x_r)
-    x0 = gl.convert_layout(x0, layout, assert_trivial=True)
-    x1 = gl.convert_layout(x1, layout, assert_trivial=True)
-    return x0, x1
-
-
-@gluon.jit
 def apply_mask(
     qk,
+    subtile: gl.constexpr,
     tile_m,
     tile_n,
     BLOCK_M,
@@ -183,7 +176,11 @@ def apply_mask(
         if USE_CAUSAL_OFFSET:
             offs_m += CAUSAL_OFFSET
 
-    offs_n = tile_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LAYOUT))
+    offs_n = (
+        tile_n * BLOCK_N
+        + subtile * (BLOCK_N // 2)
+        + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, LAYOUT))
+    )
 
     if CAUSAL and MASK_END:
         mask_causal = offs_m[:, None] >= offs_n[None, :]
@@ -199,6 +196,69 @@ def apply_mask(
 
 
 @gluon.jit
+def mask_subtiles(
+    qk0,
+    qk1,
+    tile_m,
+    tile_n,
+    BLOCK_M,
+    BLOCK_N,
+    SEQLEN_K,
+    USE_CAUSAL_OFFSET,
+    CAUSAL_OFFSET,
+    LAYOUT,
+    CAUSAL,
+    MASK_END,
+):
+    if CAUSAL:
+        qk0 = apply_mask(
+            qk0,
+            0,
+            tile_m,
+            tile_n,
+            BLOCK_M,
+            BLOCK_N,
+            SEQLEN_K,
+            USE_CAUSAL_OFFSET,
+            CAUSAL_OFFSET,
+            LAYOUT,
+            CAUSAL,
+            MASK_END,
+        )
+        qk1 = apply_mask(
+            qk1,
+            1,
+            tile_m,
+            tile_n,
+            BLOCK_M,
+            BLOCK_N,
+            SEQLEN_K,
+            USE_CAUSAL_OFFSET,
+            CAUSAL_OFFSET,
+            LAYOUT,
+            CAUSAL,
+            MASK_END,
+        )
+    else:
+        # Keep the full-tile mask for short or partial noncausal sequences.
+        qk = concat_subtile(qk0, qk1)
+        offs_n = tile_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, LAYOUT)
+        )
+        qk = tl.where(offs_n[None, :] < SEQLEN_K, qk, float("-inf"))
+        qk_r = qk.reshape(qk.shape[0], 2, qk.shape[1] // 2).permute(0, 2, 1)
+        qk0, qk1 = gl.split(qk_r)
+        qk0 = gl.convert_layout(qk0, LAYOUT, assert_trivial=True)
+        qk1 = gl.convert_layout(qk1, LAYOUT, assert_trivial=True)
+    return qk0, qk1
+
+
+_mha_fwd_repr = make_kernel_repr(
+    "_mha_mxfp8_fwd", ["BLOCK_M", "BLOCK_N", "HEAD_DIM", "CAUSAL", "SHORT_SEQ"]
+)
+
+
+@gluon.jit(repr=_mha_fwd_repr)
 def _mha_fwd_subtiled(
     q_ptr,
     k_ptr,
@@ -507,9 +567,9 @@ def _mha_fwd_subtiled(
     qk1 = gl.amd.cdna5.wmma_scaled(q, q_scale, "e4m3", k1, k1_scale, "e4m3", qk_zeros)
 
     if (CAUSAL or SHORT_SEQ) and num_n_iter <= 2:
-        qk = concat_subtile(qk0, qk1)
-        qk = apply_mask(
-            qk,
+        qk0, qk1 = mask_subtiles(
+            qk0,
+            qk1,
             pid_m,
             0,
             BLOCK_M,
@@ -521,7 +581,6 @@ def _mha_fwd_subtiled(
             CAUSAL,
             SHORT_SEQ,
         )
-        qk0, qk1 = split_subtile(qk)
 
     qk = concat_subtile(qk0, qk1)
     m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
@@ -541,7 +600,6 @@ def _mha_fwd_subtiled(
     )
 
     for _ in range(num_n_iter - 3):
-
 
         gl.barrier()
         with gl.amd.warp_pipeline_stage("stage0"):
@@ -598,11 +656,15 @@ def _mha_fwd_subtiled(
             l_ij = gl.sum(p, 1)
             l_i = gl.fma(l_i, alpha, l_ij)
             p_quant = p.to(gl.float8e4nv)
-            p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P, assert_trivial=True)
+            p_quant = gl.convert_layout(
+                p_quant, layout=DOT_LAYOUT_P, assert_trivial=True
+            )
 
         gl.barrier()
         with gl.amd.warp_pipeline_stage("stage2"):
-            acc0 = gl.amd.cdna5.wmma_scaled(p_quant, 0, "e4m3", v0, v0_scale, "e4m3", acc0)
+            acc0 = gl.amd.cdna5.wmma_scaled(
+                p_quant, 0, "e4m3", v0, v0_scale, "e4m3", acc0
+            )
             v1 = local_load_v(
                 v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
             )
@@ -633,7 +695,9 @@ def _mha_fwd_subtiled(
 
         gl.amd.gfx1250.tdm.async_wait(4)
         with gl.amd.warp_pipeline_stage("stage3"):
-            acc1 = gl.amd.cdna5.wmma_scaled(p_quant, 0, "e4m3", v1, v1_scale, "e4m3", acc1)
+            acc1 = gl.amd.cdna5.wmma_scaled(
+                p_quant, 0, "e4m3", v1, v1_scale, "e4m3", acc1
+            )
             k0 = local_load_k(
                 k_buffer, read_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
             )
@@ -694,9 +758,9 @@ def _mha_fwd_subtiled(
         )
         if CAUSAL or SHORT_SEQ:
             num_n_iter = gl.maximum(num_n_iter, 3)
-            qk = concat_subtile(qk0, qk1)
-            qk = apply_mask(
-                qk,
+            qk0, qk1 = mask_subtiles(
+                qk0,
+                qk1,
                 pid_m,
                 num_n_iter - 2,
                 BLOCK_M,
@@ -708,7 +772,6 @@ def _mha_fwd_subtiled(
                 CAUSAL,
                 SHORT_SEQ,
             )
-            qk0, qk1 = split_subtile(qk)
 
         v0 = local_load_v(
             v_buffer, read_idx_v, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
@@ -807,9 +870,9 @@ def _mha_fwd_subtiled(
         )
 
         if CAUSAL or not EVEN_N or SHORT_SEQ:
-            qk = concat_subtile(qk0, qk1)
-            qk = apply_mask(
-                qk,
+            qk0, qk1 = mask_subtiles(
+                qk0,
+                qk1,
                 pid_m,
                 num_n_iter - 1,
                 BLOCK_M,
@@ -821,7 +884,6 @@ def _mha_fwd_subtiled(
                 CAUSAL,
                 not EVEN_N or SHORT_SEQ,
             )
-            qk0, qk1 = split_subtile(qk)
 
         v0 = local_load_v(
             v_buffer, read_idx_v, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V

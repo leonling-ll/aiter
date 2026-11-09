@@ -79,6 +79,9 @@ class Case:
             Case(1, 2, 2, 64, 64, 128),
             Case(1, 1, 1, 128, 128, 128),
             Case(1, 8, 8, 256, 256, 128),
+            # Partial query tiles at the two/three KV-tile pipeline boundary.
+            Case(1, 4, 2, 192, 192, 128),
+            Case(1, 4, 2, 320, 320, 128),
             Case(2, 8, 8, 512, 512, 128),
             Case(2, 8, 8, 512, 512, 64),
             Case(4, 32, 32, 1024, 1024, 128),

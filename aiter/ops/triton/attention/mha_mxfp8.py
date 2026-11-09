@@ -14,7 +14,10 @@ from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config
 def get_mha_fwd_config(seqlen_q, seqlen_k, causal) -> dict:
     cfg_dir = resolve_config_dir("attention", "MHA", backend="gluon")
     configs = load_config_json(f"{cfg_dir}/mxfp8.json")
-    key = "causal_unequal_seqs" if causal and seqlen_q < seqlen_k else "default"
+    if causal:
+        key = "causal_unequal_seqs" if seqlen_q < seqlen_k else "causal"
+    else:
+        key = "default"
     return dict(configs[key])
 
 
@@ -62,7 +65,7 @@ def mha_fwd(
     causal: bool = False,
 ) -> torch.Tensor:
     """
-    Multi-head attention forward with per-tensor fp8 (e4m3) Q, K and V.
+    Multi-head attention forward with MXFP8 (e4m3) Q, K and V.
 
     q:         [B, HQ, SQ, D] (layout "bhsd") dtype float8_e4m3fn.
     k, v:      [B, HK, SK, D] dtype float8_e4m3fn. HQ must be a multiple of HK
