@@ -1,9 +1,19 @@
+from contextlib import nullcontext
+
 import triton.experimental.gluon.language as gl
 import triton.language as tl
 from triton.experimental import gluon
 from triton.language.extra.libdevice import fast_dividef
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+
+@gluon.constexpr_function
+def _get_pipeline_stage(enabled):
+    # Select the existing scope at compile time without copying stage bodies.
+    if enabled:
+        return gl.amd.warp_pipeline_stage
+    return lambda *args, **kwargs: nullcontext()
 
 
 @gluon.jit
@@ -316,6 +326,8 @@ def _mha_fwd_subtiled(
     WMMA_LAYOUT_QK: gl.constexpr,
     WMMA_LAYOUT_O: gl.constexpr,
 ):
+    USE_WARP_PIPELINE: gl.constexpr = CAUSAL or SHORT_SEQ
+    pipeline_stage: gl.constexpr = _get_pipeline_stage(USE_WARP_PIPELINE)
     BLOCK_N_MX: gl.constexpr = BLOCK_N // 32
     HEAD_DIM_MX: gl.constexpr = HEAD_DIM // 32
     HEAD_DIM_POW2_MX: gl.constexpr = HEAD_DIM_POW2 // 32
@@ -601,8 +613,10 @@ def _mha_fwd_subtiled(
 
     for _ in range(num_n_iter - 3):
 
+        if not USE_WARP_PIPELINE:
+            gl.amd.hint.sched_barrier()
         gl.barrier()
-        with gl.amd.warp_pipeline_stage("stage0"):
+        with pipeline_stage("stage0"):
             qk0 = gl.amd.cdna5.wmma_scaled(
                 q, q_scale, "e4m3", k0, k0_scale, "e4m3", qk_zeros
             )
@@ -636,8 +650,10 @@ def _mha_fwd_subtiled(
             )
             write_idx_v += 1
 
+        if not USE_WARP_PIPELINE:
+            gl.amd.hint.sched_barrier()
         gl.amd.gfx1250.tdm.async_wait(4)
-        with gl.amd.warp_pipeline_stage("stage1"):
+        with pipeline_stage("stage1"):
             qk1 = gl.amd.cdna5.wmma_scaled(
                 q, q_scale, "e4m3", k1, k1_scale, "e4m3", qk_zeros
             )
@@ -660,8 +676,10 @@ def _mha_fwd_subtiled(
                 p_quant, layout=DOT_LAYOUT_P, assert_trivial=True
             )
 
+        if not USE_WARP_PIPELINE:
+            gl.amd.hint.sched_barrier()
         gl.barrier()
-        with gl.amd.warp_pipeline_stage("stage2"):
+        with pipeline_stage("stage2"):
             acc0 = gl.amd.cdna5.wmma_scaled(
                 p_quant, 0, "e4m3", v0, v0_scale, "e4m3", acc0
             )
@@ -693,8 +711,10 @@ def _mha_fwd_subtiled(
             )
             write_idx_k += 1
 
+        if not USE_WARP_PIPELINE:
+            gl.amd.hint.sched_barrier()
         gl.amd.gfx1250.tdm.async_wait(4)
-        with gl.amd.warp_pipeline_stage("stage3"):
+        with pipeline_stage("stage3"):
             acc1 = gl.amd.cdna5.wmma_scaled(
                 p_quant, 0, "e4m3", v1, v1_scale, "e4m3", acc1
             )
@@ -717,7 +737,9 @@ def _mha_fwd_subtiled(
     # iter last - 2
 
     gl.barrier()
-    with gl.amd.warp_pipeline_stage("ep0_0"):
+    if not USE_WARP_PIPELINE:
+        gl.amd.hint.sched_barrier()
+    with pipeline_stage("ep0_0"):
         qk0 = gl.amd.cdna5.wmma_scaled(
             q, q_scale, "e4m3", k0, k0_scale, "e4m3", qk_zeros
         )
@@ -752,7 +774,9 @@ def _mha_fwd_subtiled(
         write_idx_v += 1
 
     gl.amd.gfx1250.tdm.async_wait(4)
-    with gl.amd.warp_pipeline_stage("ep0_1"):
+    if not USE_WARP_PIPELINE:
+        gl.amd.hint.sched_barrier()
+    with pipeline_stage("ep0_1"):
         qk1 = gl.amd.cdna5.wmma_scaled(
             q, q_scale, "e4m3", k1, k1_scale, "e4m3", qk_zeros
         )
@@ -791,7 +815,9 @@ def _mha_fwd_subtiled(
         p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P, assert_trivial=True)
 
     gl.barrier()
-    with gl.amd.warp_pipeline_stage("ep0_2"):
+    if not USE_WARP_PIPELINE:
+        gl.amd.hint.sched_barrier()
+    with pipeline_stage("ep0_2"):
         acc0 = gl.amd.cdna5.wmma_scaled(p_quant, 0, "e4m3", v0, v0_scale, "e4m3", acc0)
         v1 = local_load_v(
             v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
@@ -809,7 +835,9 @@ def _mha_fwd_subtiled(
         m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
 
     gl.amd.gfx1250.tdm.async_wait(2)
-    with gl.amd.warp_pipeline_stage("ep0_3"):
+    if not USE_WARP_PIPELINE:
+        gl.amd.hint.sched_barrier()
+    with pipeline_stage("ep0_3"):
         acc1 = gl.amd.cdna5.wmma_scaled(p_quant, 0, "e4m3", v1, v1_scale, "e4m3", acc1)
         k0 = local_load_k(
             k_buffer, read_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
@@ -841,7 +869,9 @@ def _mha_fwd_subtiled(
     # iter last - 1
 
     gl.barrier()
-    with gl.amd.warp_pipeline_stage("ep1_0"):
+    if not USE_WARP_PIPELINE:
+        gl.amd.hint.sched_barrier()
+    with pipeline_stage("ep1_0"):
         qk0 = gl.amd.cdna5.wmma_scaled(
             q, q_scale, "e4m3", k0, k0_scale, "e4m3", qk_zeros
         )
@@ -864,7 +894,9 @@ def _mha_fwd_subtiled(
         acc1 = acc1 * alpha[:, None]
 
     gl.amd.gfx1250.tdm.async_wait(2)
-    with gl.amd.warp_pipeline_stage("ep1_1"):
+    if not USE_WARP_PIPELINE:
+        gl.amd.hint.sched_barrier()
+    with pipeline_stage("ep1_1"):
         qk1 = gl.amd.cdna5.wmma_scaled(
             q, q_scale, "e4m3", k1, k1_scale, "e4m3", qk_zeros
         )
@@ -903,7 +935,9 @@ def _mha_fwd_subtiled(
         p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P)
 
     gl.barrier()
-    with gl.amd.warp_pipeline_stage("ep1_2"):
+    if not USE_WARP_PIPELINE:
+        gl.amd.hint.sched_barrier()
+    with pipeline_stage("ep1_2"):
         acc0 = gl.amd.cdna5.wmma_scaled(p_quant, 0, "e4m3", v0, v0_scale, "e4m3", acc0)
         v1 = local_load_v(
             v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
