@@ -196,12 +196,15 @@ def apply_mask(
         mask_causal = offs_m[:, None] >= offs_n[None, :]
         mask_oob = offs_n[None, :] < SEQLEN_K
         mask = mask_causal & mask_oob
+        qk = tl.where(mask, qk, float("-inf"))
     elif CAUSAL:
-        mask = offs_m[:, None] >= offs_n[None, :]
+        # Use an arithmetic mask. A select keeps one SGPR lane mask per element
+        # and spills at BLOCK_M=256. Key 0 is in the first tile, so m_i is finite.
+        diff = offs_m.to(gl.float32)[:, None] - offs_n.to(gl.float32)[None, :]
+        qk = gl.fma(gl.minimum(diff, 0.0), 1.0e30, qk)
     else:
         mask = offs_n[None, :] < SEQLEN_K
-
-    qk = tl.where(mask, qk, float("-inf"))
+        qk = tl.where(mask, qk, float("-inf"))
     return qk
 
 
@@ -326,7 +329,8 @@ def _mha_fwd_subtiled(
     WMMA_LAYOUT_QK: gl.constexpr,
     WMMA_LAYOUT_O: gl.constexpr,
 ):
-    USE_WARP_PIPELINE: gl.constexpr = CAUSAL or SHORT_SEQ
+    # Long runs use scheduling barriers: fewer registers than the warp pipeline.
+    USE_WARP_PIPELINE: gl.constexpr = SHORT_SEQ
     pipeline_stage: gl.constexpr = _get_pipeline_stage(USE_WARP_PIPELINE)
     BLOCK_N_MX: gl.constexpr = BLOCK_N // 32
     HEAD_DIM_MX: gl.constexpr = HEAD_DIM // 32
