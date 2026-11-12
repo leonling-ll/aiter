@@ -163,6 +163,14 @@ def concat_subtile(x, y):
 
 
 @gluon.jit
+def prepare_p(p0, p1, l_i, alpha, layout: gl.constexpr):
+    p = concat_subtile(p0, p1)
+    l_i = gl.fma(l_i, alpha, gl.sum(p, 1))
+    p_quant = gl.convert_layout(p.to(gl.float8e4nv), layout=layout, assert_trivial=True)
+    return p_quant, l_i
+
+
+@gluon.jit
 def apply_mask(
     qk,
     subtile: gl.constexpr,
@@ -331,6 +339,8 @@ def _mha_fwd_subtiled(
 ):
     # Long runs use scheduling barriers: fewer registers than the warp pipeline.
     USE_WARP_PIPELINE: gl.constexpr = SHORT_SEQ
+    # Free the full FP32 P tile before the second QK subtile allocates registers.
+    EARLY_P_PREP: gl.constexpr = not CAUSAL and not USE_WARP_PIPELINE
     pipeline_stage: gl.constexpr = _get_pipeline_stage(USE_WARP_PIPELINE)
     BLOCK_N_MX: gl.constexpr = BLOCK_N // 32
     HEAD_DIM_MX: gl.constexpr = HEAD_DIM // 32
@@ -638,6 +648,8 @@ def _mha_fwd_subtiled(
             read_idx_k += 1
             p1 = gl.exp2(qk1_shifted)
             alpha = gl.exp2(m_i - m_ij)
+            if EARLY_P_PREP:
+                p_quant, l_i = prepare_p(p0, p1, l_i, alpha, DOT_LAYOUT_P)
             m_i = m_ij
             acc0 = acc0 * alpha[:, None]
             acc1 = acc1 * alpha[:, None]
@@ -672,13 +684,8 @@ def _mha_fwd_subtiled(
                 HEAD_DIM_POW2,
                 layout=DOT_LAYOUT_V_SCALE,
             )
-            p = concat_subtile(p0, p1)
-            l_ij = gl.sum(p, 1)
-            l_i = gl.fma(l_i, alpha, l_ij)
-            p_quant = p.to(gl.float8e4nv)
-            p_quant = gl.convert_layout(
-                p_quant, layout=DOT_LAYOUT_P, assert_trivial=True
-            )
+            if not EARLY_P_PREP:
+                p_quant, l_i = prepare_p(p0, p1, l_i, alpha, DOT_LAYOUT_P)
 
         if not USE_WARP_PIPELINE:
             gl.amd.hint.sched_barrier()
@@ -761,6 +768,8 @@ def _mha_fwd_subtiled(
         read_idx_k += 1
         p1 = gl.exp2(qk1_shifted)
         alpha = gl.exp2(m_i - m_ij)
+        if EARLY_P_PREP:
+            p_quant, l_i = prepare_p(p0, p1, l_i, alpha, DOT_LAYOUT_P)
         m_i = m_ij
         acc0 = acc0 * alpha[:, None]
         acc1 = acc1 * alpha[:, None]
@@ -812,11 +821,8 @@ def _mha_fwd_subtiled(
             HEAD_DIM_POW2,
             layout=DOT_LAYOUT_V_SCALE,
         )
-        p = concat_subtile(p0, p1)
-        l_ij = gl.sum(p, 1)
-        l_i = gl.fma(l_i, alpha, l_ij)
-        p_quant = p.to(gl.float8e4nv)
-        p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P, assert_trivial=True)
+        if not EARLY_P_PREP:
+            p_quant, l_i = prepare_p(p0, p1, l_i, alpha, DOT_LAYOUT_P)
 
     gl.barrier()
     if not USE_WARP_PIPELINE:
@@ -893,6 +899,8 @@ def _mha_fwd_subtiled(
         read_idx_k += 1
         p1 = gl.exp2(qk1_shifted)
         alpha = gl.exp2(m_i - m_ij)
+        if EARLY_P_PREP:
+            p_quant, l_i = prepare_p(p0, p1, l_i, alpha, DOT_LAYOUT_P)
         m_i = m_ij
         acc0 = acc0 * alpha[:, None]
         acc1 = acc1 * alpha[:, None]
@@ -932,11 +940,8 @@ def _mha_fwd_subtiled(
             HEAD_DIM_POW2,
             layout=DOT_LAYOUT_V_SCALE,
         )
-        p = concat_subtile(p0, p1)
-        l_ij = gl.sum(p, 1)
-        l_i = gl.fma(l_i, alpha, l_ij)
-        p_quant = p.to(gl.float8e4nv)
-        p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P)
+        if not EARLY_P_PREP:
+            p_quant, l_i = prepare_p(p0, p1, l_i, alpha, DOT_LAYOUT_P)
 
     gl.barrier()
     if not USE_WARP_PIPELINE:

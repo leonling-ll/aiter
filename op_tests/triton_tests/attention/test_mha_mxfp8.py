@@ -87,6 +87,8 @@ class Case:
             Case(4, 32, 32, 1024, 1024, 128),
             Case(2, 16, 16, 2048, 2048, 128),
             Case(1, 8, 8, 4096, 4096, 128),
+            Case(1, 32, 32, 4096, 4096, 128),
+            Case(1, 32, 32, 8192, 8192, 128),
             Case(3, 5, 5, 1024, 1024, 128),
             # M not a multiple of BLOCK_M: the last program writes a partial tile
             Case(2, 4, 4, 600, 600, 128),
